@@ -129,7 +129,7 @@ before checking whether the resource became available.
 
 # EXAMPLES
 
-## Acquire resource lease with concurrency limit
+## Example. Acquire resource lease with concurrency limit
 ` `
 ```
 lease -r 'XYZ' -p $PPID -c 2 -i 30 -k 240 -w 600
@@ -144,7 +144,7 @@ Attempts to TERM other processes that held the lock for over 240 seconds.
 
 Gives up after 10 minutes of waiting.
 
-## Escalating signal sequence
+## Example. Escalating signal sequence
 ` `
 ```
 lease -r 'XYZ' -p "$(ps -p $$ -o ppid:1=)" -c 2 -i 30 -k 240:250:260=HUP:270=INT -w 600
@@ -156,7 +156,7 @@ it attempts sending signals to the lease owner:
 - `HUP` at 260 seconds
 - `INT` at 270 seconds
 
-## Expiring stale leases
+## Example. Expiring stale leases
 ` `
 ```
 lease -r 'XYZ' -p "$$" -i 30 -e 240 -w 600 || exit 1
@@ -172,4 +172,3 @@ While waiting, invalidates existing leases older than 240 seconds.
 
 Keep in mind that invalidating a lease does not necessarily make the resource immediately eligible
 to be locked, because there may be other semaphores already waiting in the FIFO queue.
-````

@@ -1,0 +1,47 @@
+#!/usr/bin/perl
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Yuri Cherio
+#
+# Update program help, embed man file into it
+
+use strict;
+use warnings;
+use Cwd();
+
+my $this_path = Cwd::abs_path($0);
+
+# Regenerate mount pages
+# system(Cwd::abs_path($this_path =~ s{[^/]+$}{../scripts/refresh-man}r));
+
+my $lease_exe_path = Cwd::abs_path($this_path =~ s{[^/]+$}{../lease}r);
+my $lease_content = read_file($lease_exe_path);
+
+my $man_file = Cwd::abs_path($this_path =~ s{[^/]+$}{../doc/lease.1}r);
+my $man_content = read_file($man_file) =~ s/\n*$/\n/sr;
+
+my ($src_pre, $src_help, $src_post) = $lease_content =~ m/^(.*<<'MAN_CONTENTS';\V*\n)(.*?)(?<=\n)(MAN_CONTENTS\n.*)$/s;
+$src_pre || die("Missing MAN_CONTENTS in the script\n");
+
+if ($man_content eq $src_help) {
+	print("Help is already up-to-date\n");
+	exit(0);
+}
+
+write_file($lease_exe_path, "$src_pre$man_content$src_post");
+print("Updated\n");
+
+exit(1); # indicate that the source file was updated
+
+sub read_file {
+	my ($fname) = @_;
+	open(my $fhandle, '<', $fname) or
+		die("Couldn't open file ($fname): $!\n");
+	do { local $/; <$fhandle> }
+}
+
+sub write_file {
+	my ($fname, $contents) = @_;
+	open(my $file_handle, '>', $fname) or
+		die "Couldn't open file for writing ($fname): $!\n";
+	print $file_handle $contents;
+}

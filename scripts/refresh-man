@@ -42,4 +42,6 @@ done
 
 rm -f "$pandoc_filters"
 
-exit $man_changed
+[ "$man_changed" = "0" ] && echo "All man files are up-to-date"
+
+[ "$man_changed" = "0" ]

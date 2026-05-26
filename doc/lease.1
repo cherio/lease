@@ -137,7 +137,7 @@ Can be specified multiple times to increase verbosity level.
 \f[B]\-h | \-\-help\f[R]
 Print this help.
 .SH EXAMPLES
-.SS Acquire resource lease with concurrency limit
+.SS Example. Acquire resource lease with concurrency limit
 \f[B]\f[R]
 .IP
 .EX
@@ -154,7 +154,7 @@ Attempts to TERM other processes that held the lock for over 240
 seconds.
 .PP
 Gives up after 10 minutes of waiting.
-.SS Escalating signal sequence
+.SS Example. Escalating signal sequence
 \f[B]\f[R]
 .IP
 .EX
@@ -169,7 +169,7 @@ available, it attempts sending signals to the lease owner:
 \f[B]HUP\f[R] at 260 seconds
 .IP \(bu 2
 \f[B]INT\f[R] at 270 seconds
-.SS Expiring stale leases
+.SS Example. Expiring stale leases
 \f[B]\f[R]
 .IP
 .EX
@@ -188,6 +188,5 @@ While waiting, invalidates existing leases older than 240 seconds.
 Keep in mind that invalidating a lease does not necessarily make the
 resource immediately eligible to be locked, because there may be other
 semaphores already waiting in the FIFO queue.
-\(ga\(ga\(ga\(ga
 .SH AUTHORS
 Yuri Cherio.
