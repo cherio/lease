@@ -1,0 +1,45 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Yuri Cherio
+#
+# Recreate man files from .MD files
+
+cd "$(dirname "$0")/../doc" ||
+	{ echo "Error: Failed cd into the project directory" >&2; exit 1; }
+
+pandoc_filters="/tmp/pandoc-filters.lua"
+
+_init_pandoc() {
+	pandoc -v >/dev/null 2>/dev/null || {
+		echo "Error: pandoc not found" >&2;
+		return 1;
+	}
+	cat > "$pandoc_filters" <<EOF
+-- Lua filter to convert inline code into bold
+function Code(el)
+  return pandoc.Strong(el.text)
+end
+EOF
+}
+
+man_changed="0"
+
+for md_file in *.man.md; do
+	man_file="${md_file%.man.md}"
+	# If the source MD file is newer than the target man file, then regenerate the target
+	if ! [ -f "./$man_file" ] || [ "./$md_file" -nt "./$man_file" ]; then
+		if [ "$man_changed" = "0" ]; then
+			man_changed="1"
+			_init_pandoc || break
+		fi
+		echo "Processing: $md_file -> $man_file"
+		pandoc --standalone --lua-filter="$pandoc_filters" -f markdown -t man < "./$md_file" > "./$man_file"
+		touch -r "./$md_file" "./$man_file"
+	else
+		: # echo "MAN $man_file: already up-to-date"
+	fi
+done
+
+rm -f "$pandoc_filters"
+
+exit $man_changed

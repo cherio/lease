@@ -31,8 +31,12 @@ $sweep && do { sweep_resource_locks(); exit(0); };
 # Input validation, format, parameter presense etc
 my $command_present = scalar(@ARGV); # instead of returning success - launch the supplied command
 if ($command_present) {
+	$ARGV[0] eq '--' && shift(@ARGV); # remove '--' if present
 	$owner_pid //= $$;
-	$resource_id //= eval{ use Digest::SHA(); Digest::SHA::sha256_base64(join(q( ), @ARGV)) =~ s|\W|_|gr };
+	$resource_id //= eval {
+		require Digest::SHA;
+		Digest::SHA::sha256_base64(join(q( ), @ARGV)) =~ s|\W|_|gr
+	};
 	prnt("User command present: ".join(',', @ARGV)."\n") if ($verbose >= 2);
 }
 
@@ -54,7 +58,7 @@ if (!$release) {
 	}
 
 	if (defined($kill_age_spec)) {
-		# my %known_sigs = eval { use Config; ($Config{sig_name_init} =~ m/"(\w+)(", )/gs) };
+		# my %known_sigs = eval { require Config; ($Config{sig_name_init} =~ m/"(\w+)(", )/gs) };
 		$signal_spec = [];
 		my ($age_last, $sig_last) = (-1, 'TERM');
 		while ($kill_age_spec =~ m{ (?<=^|:) (\d+(?:[,\.]\d+)?) (?:\=(\w+(?:[-+]\d+)?))? (?=$|:) }xgs) {
@@ -72,6 +76,7 @@ if (!$release) {
 
 	($exclusivity =~ /^[A-Za-z]{1,48}+$/s) ||
 		quit(1, "Invalid exclusivity flag, allowed 1 to 48 alphabetic characters");
+
 	($concurrency > 0) or quit(1, "Concurency must be a positive whole number");
 }
 
@@ -339,11 +344,12 @@ sub wake_up_sema {
 }
 
 sub get_default_lock_dir {
-	my $lock_dir_name = 'zemaphore';
+	my $lock_dir_name = 'zemaphore'; # legacy name for compatibility
 	my $xdg_runtime_dir = $ENV{XDG_RUNTIME_DIR} // "/run/user/$<";
 	my $tmpfs_queue_dir = "$xdg_runtime_dir/$lock_dir_name";
 	-d $tmpfs_queue_dir && return wantarray ? ($tmpfs_queue_dir, 1) : $tmpfs_queue_dir;
 
+	# fallback to $HOME/.local/share for compatibility with OS without XDG_RUNTIME_DIR
 	my $legacy_dir = ($ENV{XDG_DATA_HOME} // "$ENV{HOME}/.local/share")."/$lock_dir_name";
 	-d $legacy_dir && return ($legacy_dir, 1);
 	!-d $xdg_runtime_dir && return wantarray ? ($legacy_dir, 0) : $legacy_dir;
@@ -363,7 +369,7 @@ sub ensure_lock_dir {
 	}
 
 	if (!-d $dir2ensure) {
-		eval { require File::Path }; # This module is only needed here
+		eval { require File::Path }; # only load the module when needed
 		File::Path::make_path($dir2ensure) or quit(2, "Couldn't create LOCK directory: $dir2ensure");
 		chmod 0700, $dir2ensure;
 		prnt("Created LOCK directory: $dir2ensure\n") if ($verbose);
@@ -440,8 +446,7 @@ sub sweep_resource_locks { #
 	$queue_dir //= ensure_lock_dir($queue_dir);
 
 	-d $queue_dir || die("Queue dir is missing: $queue_dir\n");
-	eval { require POSIX };
-	my $tick_resolution = POSIX::sysconf(&POSIX::_SC_CLK_TCK);
+	my $tick_resolution = eval { require POSIX; POSIX::sysconf(&POSIX::_SC_CLK_TCK) };
 
 	print("Queue dir: '$queue_dir'\n") if $verbose; # my $queue_dir_ls_text = `ls -1 $queue_dir`;
 	my $queue_dir_files = ls_dir($queue_dir, sub { $_[0] =~ m/\w\.lock$/ } );
@@ -474,7 +479,7 @@ sub sweep_resource_locks { #
 			print(sprintf("%s, items: %s, alive: %s, leased: %s, oldest: %s sec\n",
 				$qfile =~ s!^(?:.*?/)?([^/]+)(?:\.\w+)?$!$1!r, $line_count, $alive_count,
 				$leased_count, ($ticks_since_boot - $earliest_started) / $tick_resolution)) if $verbose;
-			print($details_text) if $verbose;
+			print($details_text) if $verbose && $details_text;
 
 			if (!$qtext_updated) { # empty queue
 				prnt("Purging empty $qfile\n") if ($verbose >= 2);

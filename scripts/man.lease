@@ -1,0 +1,14 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Yuri Cherio
+#
+# View man file
+
+cd "$(dirname "$0")" ||
+	{ echo "Error: Failed cd into directory" >&2; exit 1; }
+
+./man-gen
+
+this_base_name="${0##*man.}"
+
+man ../doc/"${this_base_name}.1"
