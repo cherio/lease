@@ -639,7 +639,7 @@ qq`SYNOPSIS
 
 DESCRIPTION
 
-	FIFO semaphore utility that manages resource owership by processes.
+	FIFO semaphore utility that manages resource ownership by processes.
 
 	Obtains a lease/ownership for the specified resource. When the resource lease is requested for a\\
 	specific PID, it succeeds if the resource is available, otherwise, it will add the\\
