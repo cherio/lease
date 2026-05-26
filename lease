@@ -1,0 +1,745 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use Fcntl();
+use Time::HiRes();
+use Getopt::Long qw(:config no_auto_abbrev no_ignore_case bundling);
+
+$| = 1; # STDOUT->autoflush(1);
+
+Getopt::Long::GetOptions (
+	'resource|r=s' => \(my $resource_id), # ID of the resource everyone competes for
+	'pid|p=i' => \(my $owner_pid), # process that wants to lease/own the resource
+	'dir|d=s' => \(my $queue_dir), # queue & semaphore lock file DIR
+	'concurrency|c=i' => \(my $concurrency = 1), # max number of parallel resource owners
+	'exclusivity|x=s' => \(my $exclusivity = 'X'), # exclusivity group code/identifier
+	'wait|w=f' => \(my $total_wait_sec), # in seconds total wait time for the resource to become available
+	'interval|i=f' => \(my $wakeup_interval_sec), # wake up this often to re-check the queue
+	'kill|k=s' => \(my $kill_age_spec), # if another owner process is "stuck", TERM it after this many SECONDS
+	'expire|e=f' => \(my $expire_age_sec), # resource will be considered automatically unlocked after this period
+	'release|R' => \(my $release), # request to release the lock on the resource
+	'sweep' => \(my $sweep), # list existing semaphores and purge zombies
+	'verbose|v+' => \(my $verbose = 0), # verbosity level, can be specified multiple times
+	'help|h' => sub { man(help(), {exitval => 0}) } # need help?
+) or quit(1, "Invalid command line options\n\n" . help());
+
+my $_sep_ = ' '; # queue descriptor field separator: line, pid, started, leased, exclusivity, concurrency, sema_pid, sema_started
+my $rx_pid_line = qr/^((\d++)\Q$_sep_\E([\d\.]++)\Q$_sep_\E([\d\.]++)\Q$_sep_\E(\w++)\Q$_sep_\E(\d++)\Q$_sep_\E(\d++)\Q$_sep_\E([\d\.]++))$/m;
+
+$sweep && do { sweep_resource_locks(); exit(0); };
+
+# Input validation, format, parameter presense etc
+my $command_present = scalar(@ARGV); # instead of returning success - launch the supplied command
+if ($command_present) {
+	$owner_pid //= $$;
+	$resource_id //= eval{ use Digest::SHA(); Digest::SHA::sha256_base64(join(q( ), @ARGV)) =~ s|\W|_|gr };
+	prnt("User command present: ".join(',', @ARGV)."\n") if ($verbose >= 2);
+}
+
+($resource_id && $resource_id =~ /^(?=\w)[\w\-]{3,64}+(?<=\w)$/s) ||
+	man("Resource ID must be 3-64 characters long: allowed characters are [a-zA-Z0-9_-]\n\n" . help(), {exitval => 1});
+defined($owner_pid) || man("PID is invalid or missing\n\n" . help(), {exitval => 1});
+
+my $signal_spec; # a flat array: delay:sig[,delay:sig...]
+
+if (!$release) {
+	($total_wait_sec //= 0) == 0 || $total_wait_sec >= 0.01 ||
+		quit(1, "Wait time can be zero or >= 0.01");
+
+	if (!$total_wait_sec) {
+		$wakeup_interval_sec = undef; # no waiting, no waking
+	} else {
+		$wakeup_interval_sec //= min(30, exp(0.71 * log($total_wait_sec)) * 0.2); # default derived from wait time
+		($wakeup_interval_sec >= 0.001) || quit(1, "Wake up interval must be >= 0.001");
+	}
+
+	if (defined($kill_age_spec)) {
+		# my %known_sigs = eval { use Config; ($Config{sig_name_init} =~ m/"(\w+)(", )/gs) };
+		$signal_spec = [];
+		my ($age_last, $sig_last) = (-1, 'TERM');
+		while ($kill_age_spec =~ m{ (?<=^|:) (\d+(?:[,\.]\d+)?) (?:\=(\w+(?:[-+]\d+)?))? (?=$|:) }xgs) {
+			my ($age, $sig) = ($1, $2);
+			$age_last < $age || quit(1, "Signal delay intervals must go in ascending order");
+			push(@$signal_spec, ($age_last = $age), ($sig_last = uc($sig // $sig_last)));
+			# $known_sigs{$sig_last} || quit(1, "Invalid signal: $sig_last");
+		}
+		scalar(@$signal_spec) || quit(1, "Invalid signal specification");
+		prnt("Signal delay intervals: ".join(',', @$signal_spec)."\n") if ($verbose >= 3);
+	}
+
+	!defined($expire_age_sec) || $expire_age_sec >= 0 ||
+		quit(1, "Expiration time can't be negative");
+
+	($exclusivity =~ /^[A-Za-z]{1,48}+$/s) ||
+		quit(1, "Invalid exclusivity flag, allowed 1 to 48 alphabetic characters");
+	($concurrency > 0) or quit(1, "Concurency must be a positive whole number");
+}
+
+$queue_dir = ensure_lock_dir($queue_dir);
+
+my $queue_file = "$queue_dir/$resource_id.lock"; # Synchronize by resource token
+my $request_time_sec = Time::HiRes::time(); # Used to check if wait should give up waiting and just quit
+
+my $res_label = $release ? "release: sema=$$ -r $resource_id -p $owner_pid --que=$queue_file"
+	: "queue: sema=$$ -r $resource_id -p $owner_pid --que=$queue_file -x $exclusivity"
+		." -c $concurrency"
+		.($wakeup_interval_sec ? " -i $wakeup_interval_sec" : '')
+		.($total_wait_sec ? " -w $total_wait_sec" : '')
+		.(defined($kill_age_spec) ? " -k $kill_age_spec" : '')
+		.($verbose ? " -v" x $verbose : '');
+prnt("$res_label\n") if ($verbose);
+
+# Gather process information and SELF-validate
+my $owner_started = get_pid_started($owner_pid) // 0;
+my $sema_started = get_pid_started($$) // quit(2, "ERROR! Semaphore can not detect its PID: $$\n");
+quit(3, "Owner PID $owner_pid is not found") if (!$owner_started && !$release);
+my $this_entry_text = $release ? '' :
+	(join($_sep_, ($owner_pid, $owner_started, 0, $exclusivity, $concurrency, $$, $sema_started)) . "\n");
+
+$SIG{PIPE} = $SIG{USR1} = $SIG{USR2} = 'IGNORE'; # this signal is used to wake up the process from sleep
+
+# wake up signal handler
+my $usr1_wake_handler = ($verbose >= 3) ? sub { prnt("Received wake-up (USR1): {$owner_pid/$$}\n") } : sub {};
+
+my $owner_signalled = {}; # pid => [delay,signal,...]; problem: may accumulate terminated process records
+
+while (1) { # Keep waiting
+	my ($sema_wait_left, $sema_lock_result) = (10); # time limit to wait for the queue lock
+	my $sema_give_up_deadline_sec = Time::HiRes::time() + $sema_wait_left;
+	while (1) { # wait to lock the queue file
+		$sema_lock_result = run_synchronized($queue_file, $sema_wait_left + 0.01, sub { revalidate_queue(@_, $this_entry_text); });
+		last if $sema_lock_result->{completed};
+		(($sema_wait_left = $sema_give_up_deadline_sec - Time::HiRes::time()) > 0) or quit(4, "Couldn't lock semaphore queue file: $queue_file");
+	}
+	$this_entry_text = ''; # this should be done just once
+	my $reval_result = $sema_lock_result->{result};
+
+	my ($nap_seconds, $sema_exit_code) = @$reval_result{qw/nap_seconds exit_code/};
+	$sema_exit_code //= 0 if $release; # always exit upon release
+	prnt("Result: pid={$owner_pid}, exit={".($sema_exit_code//'')."}, nap={".($nap_seconds//'')."} \n") if $verbose >= 2;
+
+	if (defined($sema_exit_code)) {
+		if ($sema_exit_code == 0 && $command_present) {
+			$sema_exit_code = system(@ARGV);
+			system($0, '-r', $resource_id, '-p', $owner_pid, '--release');
+		}
+		exit($sema_exit_code);
+	}
+
+	my $current_wait_time = Time::HiRes::time() - $request_time_sec;
+	my $remaining_wait_sec = $total_wait_sec - $current_wait_time;
+	$nap_seconds = min($nap_seconds, $remaining_wait_sec, $wakeup_interval_sec); # minimum between scheduld nap time and remaining wait time
+	prnt("Curr wait time: {$current_wait_time}, left: {$remaining_wait_sec}, next nap: {$nap_seconds} sec, {$owner_pid/$$}\n") if ($verbose >= 2);
+	quit(5, "I've been waiting for too long, bye-bye: [$res_label].\n") if ($remaining_wait_sec <= 0);
+
+	{
+		local $SIG{USR1} = $usr1_wake_handler; # allow the signal to wake up the process
+		Time::HiRes::nanosleep(int($nap_seconds * 1000000000)); # can be awoken by semaphore "release"
+	}
+}
+
+prnt("Green light for [$res_label]\n") if $verbose;
+exit(0);
+
+sub revalidate_queue {
+	my ($queue_fhandle, $this_entry_text) = @_; # Semaphore file handle
+	quit(10, "Lock file file handle is not initialized") if !defined($queue_fhandle);
+
+	# Read process QUEUE file
+	my $queue_text_src = do { local $/; <$queue_fhandle> } . ''; # Slurp the whole queue file
+	prnt("Contents read: $queue_text_src") if ($verbose >= 4);
+
+	prnt("New queue line: $this_entry_text") if $this_entry_text && $verbose >= 2;
+	# function result affecting variables
+	my $queue_text_wrk = $queue_text_src . $this_entry_text;
+	my $queue_text_res = '';
+	my ($next_nap_seconds, $sema_exit_code, $sema_found_self, $owner_found_self);
+	my $release_found; # "release" action specific, flags if it found its owner
+
+	# loop only variables
+	my $entries = []; # [semaphore entries] - all from the file
+	my $owners = {}; # pid -> [owner entries]
+
+	while ($queue_text_wrk =~ m/$rx_pid_line/g) { # parse the file, first pass
+		my ($q_src, $q_pid, $q_started, $q_leased, $q_exclusivity, $q_concurrency, $q_sema_pid, $q_sema_started) = ($1, $2, $3, $4, $5, $6, $7, $8);
+
+		my $q_sema_started_curr = $q_sema_pid ? get_pid_started($q_sema_pid) // 0 : 0; # updated semaphore started timestamp
+		if (!$q_sema_started_curr || $q_sema_started_curr ne $q_sema_started) { # semaphore is either gone or PID reused
+			($q_sema_pid, $q_sema_started) = (0, 0);
+		}
+
+		$sema_found_self |= ($$ == $q_sema_pid);
+		$owner_found_self |= ($q_pid == $owner_pid);
+
+		my $entry = { pid => $q_pid, # src => $q_src,
+			started => $q_started, leased => $q_leased, exclusivity => $q_exclusivity, concurrency => $q_concurrency,
+			sema_pid => $q_sema_pid, sema_started => $q_sema_started };
+
+		push(@$entries, $entry);
+
+		my $owner = $owners->{$q_pid} //= { leased => $q_leased, entries => [] };
+		push(@{$owner->{entries}}, $entry);
+
+		if ($owner->{remove}) {
+			next;
+		}
+
+		if ($release && $owner_pid == $q_pid) {
+			prnt("Marking for release: $q_pid\n") if ($verbose >= 3);
+			$release_found = 1;
+			$sema_exit_code //= 0;
+			$owner->{remove} = 1;
+			next;
+		}
+
+		if (!exists $owner->{missing}) {
+			my $q_started_curr = get_pid_started($q_pid) // 0; # updated item started timestamp
+			if ($owner->{missing} = (!$q_started_curr || $q_started_curr ne $q_started)) {
+				prnt("Owner is gone, skipping: $q_pid\n") if ($verbose >= 2);
+				$owner->{remove} = 1;
+				next; # next line - owner is gone anyway
+			};
+		}
+
+		if ($owner->{leased} > $q_leased && $q_leased) {
+			$owner->{leased} = $q_leased; # this applies to all owner PID entries
+		}
+	}
+
+	# purge terminated process IDs
+	for my $signalled_pid (keys %$owner_signalled) {
+		my $owner = $owners->{$signalled_pid};
+		if (!$owner || $owner->{remove}) {
+			delete $owner_signalled->{$signalled_pid} ;
+		}
+	}
+
+	my $owners_concurrent = {}; # hash to track/count owners as they appear in entries
+	my $unique_entries = {}; # hash to track duplicate result entries
+	my $running_exclusivity; # exclusivity group of the very first entry
+	my ($max_lease_cnt, $owner_count) = (10000, 0);
+
+	for my $entry (@$entries) {
+
+		my $pid = $entry->{pid};
+		my $owner = $owners->{$pid} // quit(10, "Error! Abnormal state. Owner record not found: $pid\n");
+		if ($owner->{remove}) { # released, missing/terminated owners
+			wake_up_sema($entry->{sema_pid});
+			next;
+		}
+
+		if ($pid != $owner_pid && $owner->{leased}) { # some other (not me/self) leased
+			if (defined($signal_spec)) {{ # killing others is allowed
+				my $owner_sig_spec = $owner_signalled->{$pid} // $signal_spec;
+				$owner_sig_spec || last; # skip signaling altogether
+
+				my $age_allowance = $owner_sig_spec->[0];
+				my $owner_lease_age = Time::HiRes::time() - $owner->{leased};
+				my $till_sig = $age_allowance - $owner_lease_age;
+				if ($till_sig <= 0) { # owner lease is older than the allowance
+					kill(my $sig_name = $owner_sig_spec->[1], $pid);
+					prnt("Sending $sig_name to=$pid, age=$owner_lease_age\n") if ($verbose >= 2);
+					if (@$owner_sig_spec < 4) {
+						$owner_signalled->{$pid} = 0;
+						$till_sig = 1;
+					} else {
+						$owner_signalled->{$pid} = $owner_sig_spec = [ @$owner_sig_spec[ 2 .. $#$owner_sig_spec ] ];
+						$till_sig = min(1, $owner_sig_spec->[0] - $age_allowance); # delay between the two signals
+					}
+				}
+				if ($till_sig > 0) {
+					$next_nap_seconds = min($next_nap_seconds, $till_sig);
+					prnt("Next check in $next_nap_seconds, next sig=$owner_sig_spec->[1]\n") if ($verbose >= 2);
+				}
+			}}
+			if (defined($expire_age_sec)) { # expire leases after a certain time
+				my $owner_lease_age = Time::HiRes::time() - $owner->{leased};
+				if ($owner_lease_age >= $expire_age_sec) { # invalidate the lease
+					prnt("Lease expired, owner=$pid, age=$owner_lease_age\n") if ($verbose >= 2);
+					next; # remove the record of this lease
+				} else {
+					$next_nap_seconds = min($next_nap_seconds, $expire_age_sec - $owner_lease_age);
+				}
+			}
+		}
+
+		if ($max_lease_cnt != -1) { # adjust maximum lease count
+			$owner_count++ if !$owners_concurrent->{$pid}++; # the first time you see the borrower unique count
+			$running_exclusivity //= $entry->{exclusivity}; # the very first one
+			$max_lease_cnt = min($entry->{concurrency}, $max_lease_cnt); # Consider & respect other items concurrency
+			if ($max_lease_cnt < $owner_count || $running_exclusivity ne $entry->{exclusivity}) { # too many already running - keep waiting
+				$max_lease_cnt = -1; # no further leases allowed
+			}
+		}
+
+		if ($max_lease_cnt != -1) { # still has leases available for allocation
+			if (!$owner->{leased}) { # make sure a lease is issued to this owner
+				$owner->{leased} = Time::HiRes::time();
+			}
+		} else { # everyone else must wait
+			if ($entry->{sema_pid} == $$ && !$owner->{leased}) {
+				my $self_sema_wait_time = Time::HiRes::time() - $request_time_sec;
+				if ($total_wait_sec <= $self_sema_wait_time) {
+					$sema_exit_code //= 12; # I waited too long but the resource is still not available, time to quit
+					next; # next line
+				}
+			}
+		}
+
+		my $owner_leased = $owner->{leased};
+		my $sema_pid = $entry->{sema_pid};
+		if ($owner_leased) {
+			if ($pid == $owner_pid) {
+				$sema_exit_code //= 0; # successfull exit code
+			}
+			if ($sema_pid == $$) {
+				@$entry{qw/sema_pid sema_started/} = (0, 0); # I am done and ready to exit
+			} elsif ($sema_pid && $entry->{leased} != $owner_leased) { # wake another semaphore up
+				wake_up_sema($sema_pid);
+			}
+		} else { # not leased yet
+			if (!$sema_pid) { # requesting semaphore is gone so no one is waiting
+				prnt("Owner $pid is not leased and its semaphore is gone. Skipping\n") if ($verbose >= 2);
+				next;
+			}
+		}
+		$entry->{leased} = $owner_leased;
+
+		my $entry_line = join($_sep_, @$entry{qw/pid started leased exclusivity concurrency sema_pid sema_started/})."\n";
+		if (!$unique_entries->{$entry_line}++) { # ignore duplicate entries
+			$queue_text_res .= $entry_line;
+		}
+	}
+
+	$sema_exit_code //= 0 if $release_found;
+	$sema_exit_code //= 13 if !$sema_found_self; # someone else purged descriptor with this semaphore - quit
+	$sema_exit_code //= 14 if !$owner_found_self; # someone else purged descriptor with this owner - quit
+
+	# Test if queue CHANGED and save if it changed
+	my $queue_changed = $queue_text_res ne $queue_text_src;
+	if (!$queue_text_res) { # empty queue
+		unlink($queue_file);
+		prnt("Semaphore queue ended\n") if ($verbose >= 2);
+	} elsif ($queue_changed) {
+		prnt("Semaphore queue changed\n") if ($verbose >= 2);
+		seek($queue_fhandle, 0, Fcntl::SEEK_SET);
+		truncate($queue_fhandle, 0);
+		print $queue_fhandle $queue_text_res;
+		prnt($queue_text_res) if ($verbose >= 4);
+	}
+
+	prnt(sprintf("Queue list changed: %s, exit code: {%s}, nap: {%s}, {%s/%s}\n",
+		bool($queue_changed), $sema_exit_code // '', $next_nap_seconds // '', $owner_pid, $$)) if ($verbose >= 2);
+
+	return { exit_code => $sema_exit_code, nap_seconds => $next_nap_seconds } ;
+}
+
+sub wake_up_sema {
+	$_[0] > 0 && $_[0] != $$ && kill('USR1', $_[0]);
+}
+
+sub get_default_lock_dir {
+	my $lock_dir_name = 'zemaphore';
+	my $xdg_runtime_dir = $ENV{XDG_RUNTIME_DIR} // "/run/user/$<";
+	my $tmpfs_queue_dir = "$xdg_runtime_dir/$lock_dir_name";
+	-d $tmpfs_queue_dir && return wantarray ? ($tmpfs_queue_dir, 1) : $tmpfs_queue_dir;
+
+	my $legacy_dir = ($ENV{XDG_DATA_HOME} // "$ENV{HOME}/.local/share")."/$lock_dir_name";
+	-d $legacy_dir && return ($legacy_dir, 1);
+	!-d $xdg_runtime_dir && return wantarray ? ($legacy_dir, 0) : $legacy_dir;
+
+	if (wantarray) {
+		mkdir($tmpfs_queue_dir) or die "Could not create LOCK directory: $tmpfs_queue_dir\n$!\n";
+	}
+	return wantarray ? ($tmpfs_queue_dir, 1) : $tmpfs_queue_dir;
+}
+
+sub ensure_lock_dir {
+	my ($dir2ensure) = @_;
+
+	if (!$dir2ensure) {
+		($dir2ensure, my $dir_ensured) = get_default_lock_dir();
+		$dir_ensured && return $dir2ensure;
+	}
+
+	if (!-d $dir2ensure) {
+		eval { require File::Path }; # This module is only needed here
+		File::Path::make_path($dir2ensure) or quit(2, "Couldn't create LOCK directory: $dir2ensure");
+		chmod 0700, $dir2ensure;
+		prnt("Created LOCK directory: $dir2ensure\n") if ($verbose);
+	}
+
+	return $dir2ensure;
+}
+
+sub min {
+	my $result;
+	for (@_) {
+		$result = $_ if defined($_) && (!defined($result) || $_ < $result);
+	}
+	return $result;
+}
+
+sub bool { $_[0] ? 'Y' : 'N' }
+
+sub get_pid_started {
+	my $pid_file = "/proc/".($_[0] || return)."/stat"; # https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
+	# find /proc/*/ -maxdepth 1 -uid "$(id -u)" -name stat 2>/dev/null | xargs -I {} wc -c {} 2>/dev/null | sort -Vr | head -n 3
+	my $proc_stats = (-e $pid_file ? sysread_file($pid_file) : undef) || return;
+	my $cmd_end_pos = rindex($proc_stats, ')'); # after command line
+	my @pid_stats = split(/ /, substr($proc_stats, $cmd_end_pos + 2)); # original indexes are [2, 21], but we start with the 2nd
+	my ($state, $time_started) = @pid_stats[0, 19]; # POSIX::sysconf(&POSIX::_SC_CLK_TCK); see https://perldoc.perl.org/POSIX.html
+	return ($state && !($state eq 'Z' || $state eq 'X')) ? $time_started : undef;
+}
+
+sub run_synchronized {
+	my ($semaphore_file, $timeout, $sub, @args) = @_; # change to hash pointer
+
+	my $sema_result = lock_semaphore($semaphore_file, $timeout);
+	return { elapsed => $sema_result->{elapsed} } if (!$sema_result->{completed});
+
+	my $result = eval{ $sub->($sema_result->{handle}, @args) };
+	($_ = delete $sema_result->{handle}) && close($_); # release file lock
+	#prnt("DEBUG: sema closed $$\n");
+
+	die ($@) if ($@); # re-raise the exception
+	return { result => $result, completed => 1 }; # no error
+}
+
+sub lock_semaphore {
+	my ($sema_file, $timeout) = @_;
+	my ($started, $sema_fhandle) = (Time::HiRes::time());
+
+	my $lock_result = eval {
+		run_blocking($timeout, sub {
+			while (1) {
+				sysopen($sema_fhandle, $sema_file, Fcntl::O_RDWR|Fcntl::O_CREAT) or
+					die "Failed to open '$sema_file': $!"; # oh well, we tried
+				flock($sema_fhandle, Fcntl::LOCK_EX) or die "Failed to flock '$sema_file': $!"; # refuse to continue
+
+				# ensure no one renamed, replaced or removed the file while we were waiting for 'flock'
+				my $hndl_inode = ([stat($sema_fhandle)])->[1] // 'y';
+				my $name_inode = ([stat($sema_file)] // [])->[1] // 'x';
+				last if "$hndl_inode" eq "$name_inode"; # the right file is locked
+
+				close($sema_fhandle); # close and try again
+			}
+		})
+	};
+
+	if ($@ || !$lock_result->{completed}) { # there was an error or timed out
+		close($sema_fhandle) if defined($sema_fhandle); # release file lock
+		die ($@) if ($@);
+		$sema_fhandle = undef;
+	}
+
+	return { handle => $sema_fhandle, elapsed => Time::HiRes::time() - $started, completed => defined($sema_fhandle) };
+}
+
+sub sweep_resource_locks { #
+	$queue_dir //= ensure_lock_dir($queue_dir);
+
+	-d $queue_dir || die("Queue dir is missing: $queue_dir\n");
+	eval { require POSIX };
+	my $tick_resolution = POSIX::sysconf(&POSIX::_SC_CLK_TCK);
+
+	print("Queue dir: '$queue_dir'\n") if $verbose; # my $queue_dir_ls_text = `ls -1 $queue_dir`;
+	my $queue_dir_files = ls_dir($queue_dir, sub { $_[0] =~ m/\w\.lock$/ } );
+
+	my $ticks_since_boot = get_pid_started($$); # ticks as of now since boot
+	for my $qfile (sort @$queue_dir_files) {
+		my $qfpath = "$queue_dir/$qfile";
+		my $sema_lock_result = run_synchronized($qfpath, 2, sub { # run locked
+			my $qhandle = shift;
+			my $qtext = do { local $/; <$qhandle> } . '';
+			my $qtext_updated = '';
+			my ($line_count, $alive_count, $leased_count, $earliest_started) = (0, 0, 0, $ticks_since_boot);
+			my $details_text = '';
+			while ($qtext =~ m/$rx_pid_line/g) {
+				my ($q_line, $q_pid, $q_started, $q_leased, $q_exclusivity, $q_concurrency, $q_sema_pid, $q_sema_started) = ($1, $2, $3, $4, $5, $6, $7, $8);
+				$line_count++;
+				my $is_alive = $q_started == (get_pid_started($q_pid) // 0); # same start time - still alive
+				if ($is_alive) {
+					$alive_count++;
+					$leased_count++ if $q_leased;
+					$earliest_started = $q_started if $q_started < $earliest_started;
+					my $pid_live_sec = ($ticks_since_boot - $q_started) / $tick_resolution;
+					$details_text .= sprintf("	%s/%s, age: %s sec, leased: %s, concurrency: %s, exclusivity: %s\n",
+						$q_pid, $q_sema_pid || '', $pid_live_sec, $q_leased ? 'yes' : 'no', $q_concurrency, $q_exclusivity);
+					$qtext_updated .= "$q_line\n";
+				} else {
+					$details_text .= sprintf("	%s, ZOMBIE\n", $q_pid);
+				}
+			}
+			print(sprintf("%s, items: %s, alive: %s, leased: %s, oldest: %s sec\n",
+				$qfile =~ s!^(?:.*?/)?([^/]+)(?:\.\w+)?$!$1!r, $line_count, $alive_count,
+				$leased_count, ($ticks_since_boot - $earliest_started) / $tick_resolution)) if $verbose;
+			print($details_text) if $verbose;
+
+			if (!$qtext_updated) { # empty queue
+				prnt("Purging empty $qfile\n") if ($verbose >= 2);
+				unlink($qfpath);
+			} elsif ($qtext ne $qtext_updated) { # updated content present
+				prnt("Semaphore slimmed $qfile\n") if ($verbose >= 2);
+				seek($qhandle, 0, Fcntl::SEEK_SET);
+				truncate($qhandle, 0);
+				print $qhandle $qtext_updated;
+			}
+		});
+
+	}
+}
+
+# An IO operation may hang infinitely; this function allows setting a time limit
+sub run_blocking {
+	my ($timeout, $sub, @args) = @_;
+	my ($started, $alrm_message) = (Time::HiRes::time(), "b00m\n");
+	my $result = eval {
+		local $SIG{ALRM} = sub { die $alrm_message };
+		Time::HiRes::alarm($timeout);
+		my $result = $sub->(@args);
+		alarm(0); # Cancel alarm
+		return $result;
+	};
+
+	die ($@) if ($@ && $@ ne $alrm_message);
+	return { result => $result, elapsed => Time::HiRes::time() - $started, completed => !$@ };
+}
+
+sub sysread_file {
+	sysopen(my $file_handle, $_[0], Fcntl::O_RDONLY) or return;
+	sysread($file_handle, my $buffer, 4096) or return;
+	return $buffer;
+}
+
+sub prnt {
+	my ($msg, $handle) = (@_, *STDOUT);
+	my $pfx = $verbose >= 2 ? get_iso_timestamp('HH:mm:ss.SSS', Time::HiRes::time()) . ' ' : '';
+	print $handle $pfx . $msg;
+}
+
+sub get_iso_timestamp { # get_iso_timestamp('[[YY]YY-MM-DD] [HH:mm[:ss[.SSSSSS]]]' [, [Time::HiRes::]time() | Time::HiRes::gettimeofday() ])
+	my ($format, $time) = @_;
+	#print("$format\n");
+
+	if (!$time) {
+		$time = [time(), '0'];
+	} elsif (ref($time) eq '') {
+		$time = $time =~ /^(\d++)(?:\.(\d*))?/ ? [$1, substr(($2 // '') . '000000', 0, 6)] : die("bad seconds");
+	}
+	die('bad time') if (ref($time) ne 'ARRAY');
+
+	my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime($time->[0]);
+	$year += 1900;
+	$mon++;
+	#print(join('|', ($micros, $sec, $min, $hour, $mday, $mon, $year)) . "\n");
+	my $l_pad = sub {
+		my ($val, $len, $ch) = @_;
+		my $len_diff = $len - length($val);
+		return ($len_diff <= 0 ? '' : $ch x $len_diff) . "$val";
+	};
+
+	# 0-Y 2-M 4-D 6-H 8-m 10-s 12-S
+	my $result = '';
+	while ($format =~ /((.)\2*)/g) { # repeated character
+		my ($seq, $seq_char) = ($1, $2);
+		$result .= $seq_char eq 'Y' ? substr("0000$year", -length($seq))
+			: $seq_char eq 'M' ? $l_pad->($mon, length($seq), '0')
+			: $seq_char eq 'D' ? $l_pad->($mday, length($seq), '0')
+			: $seq_char eq 'd' ? $l_pad->($yday, length($seq), '0')
+			: $seq_char eq 'H' ? $l_pad->($hour, length($seq), '0')
+			: $seq_char eq 'm' ? $l_pad->($min, length($seq), '0')
+			: $seq_char eq 's' ? $l_pad->($sec, length($seq), '0')
+			: $seq_char eq 'S' ? substr("000000$time->[1]", -6, length($seq))
+			: $seq_char eq 'w' ? $l_pad->($wday, length($seq), '0')
+			: $seq;
+	}
+
+	return $result;
+}
+
+sub ls_dir {
+	my ($dir, $check) = @_;
+	opendir(my $dir_handle, $dir) || die("Can not open $dir: $!");
+	my @files = ();
+	while (defined(my $file = readdir($dir_handle))) {
+		utf8::decode($file);
+		$check->($file) && push(@files, $file);
+	}
+	return \@files;
+}
+
+sub man { # Correct indentation in text lines and wrap lines based on screen width; use to print help/man
+	my ($text, $spec) = (@_, {}); # <text to be formatted>, <spec see below>
+	my $tab_width = $spec->{tab_width} // 4; # spaces per tab, used for indentation
+	my $max_line_width = $spec->{max_width}; # even if terminal is wider - use this max width
+	my $page_width = $spec->{page_width} // $ENV{COLUMNS} // `tput cols 2>/dev/null`; # screen characters width
+	my $exit_code = $spec->{exit} // $spec->{exitval}; # print the result text and call exit with this exit code
+	my $out_handle = $spec->{stderr} ? *STDERR : *STDOUT;
+	$page_width = $page_width =~ m/([1-9]\d+)/ ? $1 : 80;
+	$page_width = $max_line_width if ($max_line_width && $max_line_width < $page_width);
+
+	my $result_rows = ''; # Formatted result text is accumulated here
+	my $row_index = 0; # line counter
+	my @lines = split(/(?<!\\)\v/, $text, 1000000); # break by line
+	for my $line_src (@lines) {
+		$result_rows .= "\n" if $row_index++ > 0;
+		next if !$line_src;
+
+		my $ident_tabs = $line_src =~ /^(\t*+)/s ? $1 : '';
+		my $line_ident_width = length($ident_tabs) * $tab_width; # row/line indentation in spaces
+		my $row_ident_spaces = ' ' x $line_ident_width;
+		my $row_max_length = $page_width - $line_ident_width; # row width adjusted for indentation
+
+		my $row_text;
+		while ($line_src =~ /(\S++)(\s*)/gs) {
+			my ($word, $space) = ($1, $2);
+			if (substr($word, -1) eq '\\' && $space =~ /^[\r\n]/s) {
+				$word = substr($word, 0, -1);
+			}
+			if (!$row_text) { # first word in the line
+				$row_text = $word;
+			} elsif (length($row_text) + length($word) + 1 > $row_max_length) { # save previous row text
+				$result_rows .= $row_ident_spaces . $row_text . "\n";
+				$row_text = $word;
+			} else { # add word to current row
+				$row_text .= ' ' . $word;
+			}
+		}
+		$result_rows .= $row_ident_spaces . $row_text if $row_text;
+	}
+
+	defined($exit_code) && quit($exit_code, $result_rows, $out_handle);
+
+	return $result_rows;
+}
+
+sub quit { # prints a message and exits
+	my ($exitcode, $msg, $handle) = @_;
+	$handle //= $exitcode ? *STDERR : *STDOUT;
+	print $handle $msg =~ s/\s*$/\n/sr;
+	exit($exitcode) if defined($exitcode);
+}
+
+sub cmd_arg {
+	my ($arg) = @_;
+	my $escaped_arg = $arg =~ s/([\|\;\&\"\'\`\!\$\%\(\)\<\>\s\#\\])/\\$1/grs;
+	return length($escaped_arg) != length($arg) && index($arg, "'") == -1 ? "'$arg'" : $escaped_arg;
+}
+
+sub help {
+	my $script_name = $0 =~ m{[^/]+$} ? $& : $0;
+	my $queue_dir = get_default_lock_dir();
+
+qq`SYNOPSIS
+
+	$script_name [options]
+
+	$script_name [options] -- command [arguments...]
+
+DESCRIPTION
+
+	FIFO semaphore utility that manages resource owership by processes.
+
+	Obtains a lease/ownership for the specified resource. When the resource lease is requested for a\\
+	specific PID, it succeeds if the resource is available, otherwise, it will add the\\
+	requesting process to a FIFO queue and block until the resource becomes available\\
+	when the other processes that acquired the resource earlier, release it or finish executing.\\
+	A process can borrow a resource either for itself or for another process by\\
+	supplying "-p PID".
+
+	This utility can also launch user-supplied command upon successful acquisition\\
+	of this resource lease. In this case, option -p is not needed and -r is optional and\\
+	will be calculated, if not specified, by hashing the user command thus using user\\
+	command as a resource identifier.
+
+	A resource can be explicitly released with "--release" option. Otherwise the\\
+	resource will be released when the owner process ends.
+
+OPTIONS
+
+	-r {resource} | --resource={resource}
+		Resource identifier. Lease/ownership is created/aquired on this resource.
+
+	-p {PID} | --pid={PID}
+		Process ID that is to become an owner of the resource (to aquire a lease on it)
+
+	-d {directory} | --dir={directory}
+		A derectory where the semaphore/resource/queue files are. Default for this user is "$queue_dir"
+
+	-c {number} | --concurrency={number}
+		Maximum number processes allowed to own the resource (lease it) at the same time and run concurrently.\\
+		Concurrency is enforced within the same concurrency/exclusivity group. Minimum of 1 is enforced. Default is $concurrency.
+
+	-x {concurrency/exclusivity group} | --exclusivity={concurrency/exclusivity group}
+		Exclusivity group code/identifier. Only processes within one group can be executed concurrently.\\
+		Concurrency defines the maximum number of processes that can run in parallel within the same group.\\
+		If a resource lease is acquired by Group A then a request from group B will block until\\
+		all processes in group A scheduled before have completed and released this resource.\\
+		Default is "$exclusivity". (Optional)
+
+	-w {wait sec} | --wait={wait sec}
+		Wait this long (sec) before giving up on locking the resource. When wait time exceedes this parameter\\
+		the semaphore exits with non-zero code. The script keeps waiting if there are too many other processes\\
+		requested this resource. Requestors are placed in the queue to wait and get their leases as they become
+		available in FIFO order. Defaults to infinite wait.\\
+
+	-i {interval sec} | --interval={interval sec}
+		While waiting for the resource to be released the script will wake up this so often (sec) to check\\
+		whether the resource was released or the previous owner seized to exist. This is a polling/wake-up\\
+		interval. Fractional numbers allowed. Optional. The default is smartly derived from the wait time.
+
+	-k {second} | --kill={second}
+		If a anther process that owns this resource is "stuck", becomes a zombie or simply has been around for\\
+		this many SECONDS then TERM it. By default no killing is performed. Fractional numbers allowed.
+
+		This parameter also understands extended format which looks like\\
+		seconds[:SIGNAL][;seconds[:SIGNAL][;...]]. For example, this spec 300:310:400=INT:410:500=HUP:600=KILL\\
+		will send TERM signal after 300 and 310 seconds after another process lease begins; if the process\\
+		doesn't stop, it will send INT at 400 and then at 410 seconds; if the process is still active it\\
+		then sends HUP at 500 seconds and eventually KILL at 600 seconds.
+
+	- e {second} | --expire={second}
+		Resource will be considered automatically unlocked when the lease time exceeds this number of seconds.\\
+		The lease gets invalidated and the resource/lease record is purged after this.
+
+	-R | --release
+		Makes an attempt to release a previously obtained/leased resource for the resource/PID\\
+		combination. The semaphore is more efficient if it is released explicitly as it allows the\\
+		next process in the queue run immediately, otherwise it relies on periodic polling and may\\
+		wait for as long as specified with "-i" to check if the resource became available.
+
+	--sweep
+		Purge empty queues/resources. With '-v' also list the existing queues and the stats
+
+	-v | --verbose
+		Be verbose, think outloud. Can be specified multiple times to increase verbosity level
+
+	-h | --help
+		Prints this help.
+
+	--test={test spec}
+		Run test suite. See code for detail
+
+EXAMPLES
+
+	$script_name -r 'XYZ' -p \$PPID -c 2 -i 30 -k 240 -w 600
+		Asks for a lock on resource 'XYZ' for the caller shell parent process, allowing one more resource owner\\
+		to get the lock. If the resource is unavailable, it will re-check every 30 seconds.\\
+		It will attempt to TERM other processes that held the lock for over 240 seconds.\\
+		it will give up after 10 minutes of waiting.
+
+	$script_name -r 'XYZ' -p "\$(ps -p \$\$ -o ppid:1=)" -c 2 -i 30 -k 240:250:260=HUP:270=INT -w 600
+		Same as the example above, except if another lease doesn't become available, for some time it will\\
+		attempt sending signals to it - TERM at 240 & 250 seconds into lease, HUP at 260 seconds,\\
+		and INT at 270 seconds.
+
+	$script_name -r 'XYZ' -p "\$\$" -i 30 -e 240 -w 600 || exit 1
+		Attempt to lock XYZ resource for the calling shell. Check availability every 30 seconds\\
+		while waiting. If the lock isn't available after 10 minutes (600 seconds), exit\\
+		the calling shell script. While waiting invalidate existing leases older than 240 seconds.\\
+		Keep in mind that invalidating a lease doesn't necessarily make this resource eligible to\\
+		be locked because there could be other semaphores that requested the lease before this one,\\
+		waiting their turn.
+
+` }
