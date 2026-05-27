@@ -1,0 +1,188 @@
+#!/usr/bin/perl
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Yuri Cherio
+#
+# Update copyright headers and other dates
+
+use strict;
+use warnings;
+use Fcntl();
+use Cwd();
+use Time::Piece();
+
+my $month_names = [qw(January February March April May June July August September October November December)];
+
+my @files = map { Cwd::abs_path($_) } @ARGV;
+
+my $this_path = Cwd::abs_path($0);
+my $project_dir = ($this_path =~ m{^(.*)/[^/]+/[^/]+$}s) ? $1 : die("No project directory found\n");
+chdir($project_dir);
+
+my $updated_cnt = process_files(\@files);
+if ($updated_cnt) {
+	print("Updated: $updated_cnt\n");
+	exit(1); # indicate that the source file was updated
+}
+
+exit(0);
+
+sub process_files {
+	my ($file_paths) = @_;
+	my $updated_cnt = 0;
+	for my $file_path (@$file_paths) {
+		$file_path || next;
+		-f $file_path || do { print STDERR "$file_path: not found\n"; next; };
+		index($file_path, $project_dir) == 0 ||
+			do { print STDERR "$file_path: not in $project_dir\n"; next; };
+		$file_path = "./".substr($file_path, length($project_dir) + 1);
+		print("$file_path: considering ...\n");
+		$updated_cnt += process_file($file_path) // 0;
+	}
+	return $updated_cnt;
+}
+
+sub process_file_pl_sh {
+	my ($file_path) = @_;
+
+	my $meta = get_file_meta($file_path) //
+		do { print STDERR "Error getting meta on '$file_path'\n"; return; };
+
+	my $expected_line = "# Copyright (C) $meta->{year} Yuri Cherio";
+
+	my $file_contents = read_file($file_path);
+	$file_contents =~ m{^(.*?\n)(# Copyright \(C\) \d+\b\V*)(\n.*)$}s ||
+		do { print STDERR "Error detecting copyright in '$file_path'\n"; return; };
+
+	my ($pre, $found_line, $post) = ($1, $2, $3);
+	$found_line eq $expected_line &&
+		do { print("$file_path: alreay up-to-date\n"); return; };
+
+	write_file($file_path, "$pre$expected_line$post");
+	print("Updated: $file_path <-- $expected_line\n");
+	return 1;
+}
+
+sub process_file_md {
+	my ($file_path) = @_;
+
+	my $meta = get_file_meta($file_path) //
+		do { print STDERR "Error getting meta on '$file_path'\n"; return; };
+	# $meta->{changed} || return;
+
+	my $expected_line = "\% $meta->{mdy}";
+
+	my $file_contents = read_file($file_path);
+	$file_contents =~ m{^(\%\V+\v+\%\V+\v+)(\% \w+ \d+, \d{4})(\n.*)$}s ||
+		do { print STDERR "Error detecting date in '$file_path'\n"; return; };
+
+	my ($pre, $found_line, $post) = ($1, $2, $3);
+	$found_line eq $expected_line &&
+		do { print("$file_path: alreay up-to-date\n"); return; };
+
+	write_file($file_path, "$pre$expected_line$post");
+	update_mtime($file_path, $meta->{iso_ts});
+	print("Updated: $file_path <-- $expected_line\n");
+	return 1;
+}
+
+sub process_file {
+	my ($file_path) = @_;
+	my $line_one = read_line($file_path) // do {
+		print STDERR "Error reading first line from '$file_path'\n";
+		return;
+	};
+	if ($file_path =~ m{\.md$}si) {
+		return process_file_md($file_path);
+	} elsif ($line_one =~ m{^#!(?:/usr)?/bin/sh\b}s) {
+		return process_file_pl_sh($file_path);
+	} elsif ($line_one =~ m{^#!/usr/bin/perl\b}s) {
+		return process_file_pl_sh($file_path);
+	}
+	print("$file_path: not applicable\n");
+	undef
+}
+
+sub update_mtime {
+	my ($file_path, $iso_ts) = @_;
+
+	my $ts = Time::Piece->strptime($iso_ts, "%Y-%m-%d %H:%M:%S") ||
+		do { print STDERR "$file_path: failed to parse $iso_ts\n"; return; };
+
+	my $epoch_time = $ts->epoch ||
+		do { print STDERR "$file_path: failed to get epoch $iso_ts\n"; return; };
+
+	utime($epoch_time, $epoch_time, $file_path) or
+		do { print STDERR "$file_path: failed to update mtime: $!\n"; };
+}
+
+sub get_file_meta {
+	my ($file_path) = @_;
+
+	my $meta_fs = get_file_fs_meta($file_path) //
+		do { print STDERR "Error getting filesystem meta on '$file_path'\n"; return; };
+
+	my $meta_git = get_file_git_meta($file_path); # // do { print STDERR "Error getting git meta on '$file_path'\n"; return; };
+
+	my $meta = ($meta_git && !$meta_git->{changed} && $meta_git->{iso_ts} lt $meta_fs->{iso_ts}) ? $meta_git : $meta_fs;
+	# print("stat, fs=$meta_fs->{iso_ts}, git=$meta_git->{iso_ts}, res=$meta->{iso_ts}\n");
+	return $meta;
+}
+
+sub get_file_fs_meta {
+	my ($file_path) = @_;
+	my $mtime = (stat($file_path))[9] //
+		do { print STDERR "Error running stat+mtime on '$file_path': $!\n"; return; };
+	my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime($mtime);
+	return get_tsinfo_from_iso(sprintf("%04d-%02d-%02d %02d:%02d:%02d", $year + 1900, $mon + 1, $mday, $hour, $min, $sec));
+}
+
+sub get_file_git_meta {
+	my ($file_path) = @_;
+	my $git_iso_ts = readpipe(q{git log -1 --format=%cd --date=format:"%Y-%m-%d %H:%M:%S" -- }.cmd_arg($file_path)) =~ s/\v+//gsr;
+	my $git_status = readpipe("git status --porcelain ".cmd_arg($file_path)) =~ s/\v+//gsr;
+	my $meta_git = get_tsinfo_from_iso($git_iso_ts) // return;
+	$meta_git->{changed} = $git_status ? 1 : 0;
+	return $meta_git;
+}
+
+sub get_tsinfo_from_iso {
+	my ($iso_ts) = @_;
+	my ($year, $mon, $mday, $hour, $min, $sec) = ($iso_ts =~ m{^(\d+)-(\d+)-(\d+) (\d+):(\d+):(\d+)$});
+	$year || return;
+	# print("$iso_ts --> $year, $mon, $mday, $hour, $min, $sec\n");
+	my $mon_name = $month_names->[$mon - 1] // return;
+	return { year => $year, mon => $mon, mon_name => $mon_name, mday => $mday,
+		mdy => sprintf("%s %d, %04d", $mon_name, $mday + 0, $year), iso_ts => $iso_ts };
+}
+
+sub read_line {
+	my ($file_path) = @_;
+	sysopen(my $fh, $file_path, Fcntl::O_RDONLY) or
+		do { print STDERR "sysopen error on '$file_path': $!\n"; return; };
+	sysread($fh, my $buffer, 1024) or
+		do { print STDERR "sysread error on '$file_path': $!\n"; return; };
+	# substr($buffer, 0, 1) eq '#' ||
+	# 	do { print STDERR "not a script: '$file_path'\n"; return; };
+	my $eol_idx = index($buffer, "\n");
+	$eol_idx > -1 ? substr($buffer, 0, $eol_idx) : undef
+}
+
+sub read_file {
+	my ($fname) = @_;
+	open(my $fhandle, '<', $fname) or
+		die("Couldn't open file ($fname): $!\n");
+	do { local $/; <$fhandle> }
+}
+
+sub write_file {
+	my ($fname, $contents) = @_;
+	open(my $file_handle, '>', $fname) or
+		die "Couldn't open file for writing ($fname): $!\n";
+	print $file_handle $contents;
+}
+
+sub cmd_arg {
+	my ($arg) = @_;
+	my $escaped_arg = $arg =~ s/([\|\;\&\"\'\`\!\$\%\(\)\<\>\s\#\\])/\\$1/grs;
+	return length($escaped_arg) != length($arg) && index($arg, "'") == -1 ? "'$arg'" : $escaped_arg;
+}

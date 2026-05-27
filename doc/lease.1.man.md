@@ -138,7 +138,7 @@ lease -r 'XYZ' -p $PPID -c 2 -i 30 -k 240 -w 600
 Asks for a lock on resource `XYZ` for the caller shell parent process,
 allowing one more resource owner (have 2 owners) to have the lock at the same time.
 
-If the resource is unavailable, it re-checks every 30 seconds.
+While waiting for the lease to become available, re-checks every 30 seconds.
 
 Attempts to TERM other processes that held the lock for over 240 seconds.
 

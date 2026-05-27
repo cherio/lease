@@ -1,4 +1,7 @@
 #!/usr/bin/perl
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Yuri Cherio
+
 use strict;
 use warnings;
 use Fcntl();
@@ -740,7 +743,8 @@ Asks for a lock on resource \f[B]XYZ\f[R] for the caller shell parent
 process, allowing one more resource owner (have 2 owners) to have the
 lock at the same time.
 .PP
-If the resource is unavailable, it re\-checks every 30 seconds.
+While waiting for the lease to become available, re\-checks every 30
+seconds.
 .PP
 Attempts to TERM other processes that held the lock for over 240
 seconds.

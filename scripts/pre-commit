@@ -1,0 +1,20 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Yuri Cherio
+#
+# run this before committing the changes or add this as a git hook
+
+this_script="$(realpath -s "$0")"
+
+ex_code=0
+
+"${this_script%/*}/refresh-dates"
+ex_code="$((ex_code + $?))"
+
+"${this_script%/*}/refresh-man"
+ex_code="$((ex_code + $?))"
+
+"${this_script%/*}/refresh-help"
+ex_code="$((ex_code + $?))"
+
+[ "$ex_code" -eq 0 ]
