@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: 0BSD
 # Copyright (C) 2026 Yuri Cherio
 #
 # Update copyright headers and other dates
@@ -21,7 +21,7 @@ chdir($project_dir);
 
 my $updated_cnt = process_files(\@files);
 if ($updated_cnt) {
-	print("Updated: $updated_cnt\n");
+	# print("Updated dates & copyright total: $updated_cnt\n");
 	exit(1); # indicate that the source file was updated
 }
 
@@ -43,76 +43,79 @@ sub process_files {
 	return $updated_cnt;
 }
 
+sub process_copyright {
+	my ($file) = @_;
+
+	my $ts_fs = $file->{ts_fs} //
+		do { print STDERR "$file->{path}: missing mtime\n"; return; };
+
+	my $year = $ts_fs->strftime('%Y') //
+		do { print STDERR "$file->{path}: odd ts_fs\n"; return; };
+
+	my $contents = $file->{contents} =~ s{(?<=\n)([^\v\w]*Copyright \(C\) (?:\d{4}-)?)\d{4}( \V+)(?=\n)}{$1$year$2}sgr;
+	if ($contents ne $file->{contents}) {
+		$file->{contents} = $contents;
+		return $file->{changed} = 1;
+	}
+	return 0;
+}
+
+sub process_md_tags {
+	my ($file) = @_;
+
+	my $ts_fs = $file->{ts_fs} //
+		do { print STDERR "$file->{path}: missing mtime\n"; return; };
+
+	my $date = $ts_fs->strftime('%B %d, %Y') //
+		do { print STDERR "$file->{path}: odd ts_fs\n"; return; };
+
+	my $contents = $file->{contents} =~ s{^((?:[^#]\V*\n)*?date:)\h*\w+\h+\d\d,\h+\d{4}\h*\n}{$1 $date\n}sr;
+	if ($contents ne $file->{contents}) {
+		$file->{contents} = $contents;
+		return $file->{changed} = 1;
+	}
+	return 0;
+}
+
 sub process_file_pl_sh {
-	my ($file_path, $state) = @_;
-	my $ts_fs = $state->{ts_fs} //
-		do { print STDERR "$file_path: missing mtime\n"; return; };
-
-	my $expected_line = "# Copyright (C) ".$ts_fs->strftime('%Y')." Yuri Cherio";
-
-	my $file_contents = read_file($file_path);
-	$file_contents =~ m{^(.*?\n)(# Copyright \(C\) \d+\b\V*)(\n.*)$}s ||
-		do { print STDERR "$file_path: Error detecting copyright line\n"; return; };
-
-	my ($pre, $found_line, $post) = ($1, $2, $3);
-	$found_line eq $expected_line &&
-		do { print("$file_path: alreay up-to-date\n"); return; };
-
-	my $replace_line = "# Copyright (C) ".$ts_fs->strftime('%Y')." Yuri Cherio";
-	print("$file_path: $found_line -> $replace_line\n");
-
-	write_file($file_path, "$pre$replace_line$post");
-	update_mtime($file_path, $ts_fs);
-
-	return 1;
+	my ($file) = @_;
+	$file->{contents} = read_file($file->{path}) // return;
+	process_copyright($file);
 }
 
 sub process_file_md {
-	my ($file_path, $state) = @_;
-	my $ts_fs = $state->{ts_fs} //
-		do { print STDERR "$file_path: missing mtime\n"; return; };
-
-	my $expected_line = "\% ".$ts_fs->strftime('%B %d, %Y');
-
-	my $file_contents = read_file($file_path);
-	$file_contents =~ m{^(\%\V+\v+\%\V+\v+)(\% \w+ \d+, \d{4})(\n.*)$}s ||
-		do { print STDERR "$file_path: Error detecting date\n"; return; };
-
-	my ($pre, $found_line, $post) = ($1, $2, $3);
-	$found_line eq $expected_line &&
-		do { print("$file_path: alreay up-to-date\n"); return; };
-
-	my $replace_line = "\% ".$ts_fs->strftime('%B %d, %Y');
-	print("$file_path: $found_line -> $replace_line\n");
-
-	write_file($file_path, "$pre$replace_line$post");
-	update_mtime($file_path, $ts_fs);
-
-	return 1;
+	my ($file) = @_;
+	$file->{contents} = read_file($file->{path}) // return;
+	process_copyright($file);
+	process_md_tags($file);
 }
 
 sub process_file {
 	my ($file_path) = @_;
 
-	my $state = get_file_meta($file_path) //
+	my $file = get_file_meta($file_path) //
 		do { print STDERR "$file_path: Error fetching metadata\n"; return; };
 
-	$state->{changed} ||
+	$file->{git_state} ||
 		do { print("$file_path: committed, no changes - skip\n"); return; };
 
 	my $line_one = read_line($file_path) //
 		do { print STDERR "$file_path: Error reading first line\n"; return; };
 
 	if ($file_path =~ m{\.md$}si) {
-		return process_file_md($file_path, $state);
+		process_file_md($file);
 	} elsif ($line_one =~ m{^#!(?:/usr)?/bin/sh\b}s) {
-		return process_file_pl_sh($file_path, $state);
+		process_file_pl_sh($file);
 	} elsif ($line_one =~ m{^#!/usr/bin/perl\b}s) {
-		return process_file_pl_sh($file_path, $state);
+		process_file_pl_sh($file);
 	}
 
-	print("$file_path: not applicable\n");
-	undef
+	if ($file->{changed}) {
+		print("$file_path: dates & copyright updated\n");
+		write_file($file_path, $file->{contents});
+		update_mtime($file_path, $file->{ts_fs});
+	}
+	return $file->{changed};
 }
 
 sub update_mtime {
@@ -136,9 +139,8 @@ sub get_file_meta {
 	my $mtime_git = readpipe(q{git log -1 --format=%cd --date=format:"%s" -- }.cmd_arg($file_path)) =~ m/^(\d+)/s ? $1 : undef;
 	my $ts_git = $mtime_git ? Time::Piece->localtime($mtime_git) : undef;
 	my $git_status = readpipe("git status --porcelain ".cmd_arg($file_path)) =~ s/\v+//gsr;
-	my $changed = $git_status ? 1 : 0;
 
-	return { ts_fs => $ts_fs, ts_git => $ts_git, changed => $changed };
+	return { path => $file_path, ts_fs => $ts_fs, ts_git => $ts_git, git_state => $git_status ? 1 : 0 };
 }
 
 sub read_line {
@@ -156,7 +158,7 @@ sub read_line {
 sub read_file {
 	my ($fname) = @_;
 	open(my $fhandle, '<', $fname) or
-		die("Couldn't open file ($fname): $!\n");
+		do { print STDERR "error reading '$fname': $!\n"; return; };
 	do { local $/; <$fhandle> }
 }
 

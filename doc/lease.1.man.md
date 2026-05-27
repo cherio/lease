@@ -1,6 +1,10 @@
-% lease(1) Version 1.0 | User Commands
-% Yuri Cherio
-% May 27, 2026
+---
+title: lease
+section: 1
+header: User Commands
+date: May 27, 2026
+footer: Version 1.0.0
+---
 
 # NAME
 
@@ -152,9 +156,9 @@ lease -r 'XYZ' -p "$(ps -p $$ -o ppid:1=)" -c 2 -i 30 -k 240:250:260=HUP:270=INT
 Same as the example above, except that if another lease does not become available,
 it attempts sending signals to the lease owner:
 
-- `TERM` at 240 and 250 seconds
-- `HUP` at 260 seconds
-- `INT` at 270 seconds
+`TERM` at 240 and 250 seconds\
+`HUP` at 260 seconds\
+`INT` at 270 seconds
 
 ## Example. Expiring stale leases
 ` `
@@ -172,3 +176,10 @@ While waiting, invalidates existing leases older than 240 seconds.
 
 Keep in mind that invalidating a lease does not necessarily make the resource immediately eligible
 to be locked, because there may be other semaphores already waiting in the FIFO queue.
+
+# AUTHORS
+Yuri Cherio
+
+# COPYRIGHT
+Copyright (C) 2026 The Utility Project Contributors\
+Licensed under the MIT License (SPDX-License-Identifier: MIT)

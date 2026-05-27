@@ -1,6 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Yuri Cherio
+# SPDX-License-Identifier: 0BSD
 
 this_dir="$(dirname "$(realpath "$0")")"
 cd "$this_dir" || exit 1

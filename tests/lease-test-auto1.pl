@@ -1,6 +1,5 @@
 #!/usr/bin/perl
-# SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Yuri Cherio
+# SPDX-License-Identifier: 0BSD
 use strict;
 use warnings;
 

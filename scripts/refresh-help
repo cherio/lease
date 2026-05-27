@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: 0BSD
 # Copyright (C) 2026 Yuri Cherio
 #
 # Update program help, embed man file into it
@@ -17,15 +17,15 @@ my $man_file = Cwd::abs_path($this_path =~ s{[^/]+$}{../doc/lease.1}r);
 my $man_content = read_file($man_file) =~ s/\n*$/\n/sr;
 
 my ($src_pre, $src_help, $src_post) = $lease_content =~ m/^(.*<<'MAN_CONTENTS';\V*\n)(.*?)(?<=\n)(MAN_CONTENTS\n.*)$/s;
-$src_pre || die("Missing MAN_CONTENTS in the script\n");
+$src_pre || die("Error updating help section: missing MAN_CONTENTS in the script\n");
 
 if ($man_content eq $src_help) {
-	print("lease: help section is already up-to-date\n");
+	print("Help section is already up-to-date\n");
 	exit(0);
 }
 
 write_file($lease_exe_path, "$src_pre$man_content$src_post");
-print("lease: help section was updated\n");
+print("Help section was updated\n");
 
 exit(1); # indicate that the source file was updated
 
