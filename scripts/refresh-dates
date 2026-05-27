@@ -52,7 +52,7 @@ sub process_copyright {
 	my $year = $ts_fs->strftime('%Y') //
 		do { print STDERR "$file->{path}: odd ts_fs\n"; return; };
 
-	my $contents = $file->{contents} =~ s{(?<=\n)([^\v\w]*Copyright \(C\) (?:\d{4}-)?)\d{4}( \V+)(?=\n)}{$1$year$2}sgr;
+	my $contents = $file->{contents} =~ s{(?<=\n|^)([^\v\w]*Copyright \(C\) (?:\d{4}-)?)\d{4}( \V+)(?=\n)}{$1$year$2}sgr;
 	if ($contents ne $file->{contents}) {
 		$file->{contents} = $contents;
 		return $file->{changed} = 1;
@@ -108,6 +108,8 @@ sub process_file {
 		process_file_pl_sh($file);
 	} elsif ($line_one =~ m{^#!/usr/bin/perl\b}s) {
 		process_file_pl_sh($file);
+	# } elsif ($file_path =~ m{(?:^|/)LICENSE$}s) {
+	# 	process_file_pl_sh($file);
 	}
 
 	if ($file->{changed}) {
