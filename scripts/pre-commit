@@ -5,16 +5,25 @@
 # run this before committing the changes or add this as a git hook
 
 this_script="$(realpath -s "$0")"
+cd "${this_script%/*/*}" || { echo "Failed to change directory" >&2; exit 1; }
+[ -d "./.git" ] || { echo "Can not recognize the directory" >&2; exit 1; }
 
 ex_code=0
 
-"${this_script%/*}/refresh-dates"
+# Refresh revision dates and copyright year
+"${this_script%/*}/refresh-dates" ./doc/*.md
 ex_code="$((ex_code + $?))"
 
+# Refresh man files from markdown documents
 "${this_script%/*}/refresh-man"
 ex_code="$((ex_code + $?))"
 
+# Ensure the runnable script has the latest man help
 "${this_script%/*}/refresh-help"
+ex_code="$((ex_code + $?))"
+
+# Refresh revision dates in the final script
+"${this_script%/*}/refresh-dates" ./* ./scripts/* ./tests/*
 ex_code="$((ex_code + $?))"
 
 [ "$ex_code" -eq 0 ]

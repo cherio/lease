@@ -1,6 +1,6 @@
 % lease(1) Version 1.0 | User Commands
 % Yuri Cherio
-% May 26, 2026
+% May 27, 2026
 
 # NAME
 

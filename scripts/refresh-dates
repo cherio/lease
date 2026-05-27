@@ -11,6 +11,7 @@ use Cwd();
 use Time::Piece();
 
 my $month_names = [qw(January February March April May June July August September October November December)];
+my $ts_now = Time::Piece->localtime();
 
 my @files = map { Cwd::abs_path($_) } @ARGV;
 
@@ -31,85 +32,94 @@ sub process_files {
 	my $updated_cnt = 0;
 	for my $file_path (@$file_paths) {
 		$file_path || next;
-		-f $file_path || do { print STDERR "$file_path: not found\n"; next; };
-		index($file_path, $project_dir) == 0 ||
+		-r $file_path || do { print STDERR "$file_path: not found\n"; next; };
+		-f _ || next; # skip if not a regular file
+		index($file_path, $project_dir) == 0 || # not in the project directory
 			do { print STDERR "$file_path: not in $project_dir\n"; next; };
-		$file_path = "./".substr($file_path, length($project_dir) + 1);
-		print("$file_path: considering ...\n");
-		$updated_cnt += process_file($file_path) // 0;
+		my $rel_path = "./".substr($file_path, length($project_dir) + 1);
+		# print("$rel_path: considering ...\n");
+		$updated_cnt += process_file($rel_path) // 0;
 	}
 	return $updated_cnt;
 }
 
 sub process_file_pl_sh {
-	my ($file_path) = @_;
+	my ($file_path, $state) = @_;
+	my $ts_fs = $state->{ts_fs} //
+		do { print STDERR "$file_path: missing mtime\n"; return; };
 
-	my $meta = get_file_meta($file_path) //
-		do { print STDERR "Error getting meta on '$file_path'\n"; return; };
-
-	my $expected_line = "# Copyright (C) $meta->{year} Yuri Cherio";
+	my $expected_line = "# Copyright (C) ".$ts_fs->strftime('%Y')." Yuri Cherio";
 
 	my $file_contents = read_file($file_path);
 	$file_contents =~ m{^(.*?\n)(# Copyright \(C\) \d+\b\V*)(\n.*)$}s ||
-		do { print STDERR "Error detecting copyright in '$file_path'\n"; return; };
+		do { print STDERR "$file_path: Error detecting copyright line\n"; return; };
 
 	my ($pre, $found_line, $post) = ($1, $2, $3);
 	$found_line eq $expected_line &&
 		do { print("$file_path: alreay up-to-date\n"); return; };
 
-	write_file($file_path, "$pre$expected_line$post");
-	print("Updated: $file_path <-- $expected_line\n");
+	my $replace_line = "# Copyright (C) ".$ts_fs->strftime('%Y')." Yuri Cherio";
+	print("$file_path: $found_line -> $replace_line\n");
+
+	write_file($file_path, "$pre$replace_line$post");
+	update_mtime($file_path, $ts_fs);
+
 	return 1;
 }
 
 sub process_file_md {
-	my ($file_path) = @_;
+	my ($file_path, $state) = @_;
+	my $ts_fs = $state->{ts_fs} //
+		do { print STDERR "$file_path: missing mtime\n"; return; };
 
-	my $meta = get_file_meta($file_path) //
-		do { print STDERR "Error getting meta on '$file_path'\n"; return; };
-	# $meta->{changed} || return;
-
-	my $expected_line = "\% $meta->{mdy}";
+	my $expected_line = "\% ".$ts_fs->strftime('%B %d, %Y');
 
 	my $file_contents = read_file($file_path);
 	$file_contents =~ m{^(\%\V+\v+\%\V+\v+)(\% \w+ \d+, \d{4})(\n.*)$}s ||
-		do { print STDERR "Error detecting date in '$file_path'\n"; return; };
+		do { print STDERR "$file_path: Error detecting date\n"; return; };
 
 	my ($pre, $found_line, $post) = ($1, $2, $3);
 	$found_line eq $expected_line &&
 		do { print("$file_path: alreay up-to-date\n"); return; };
 
-	write_file($file_path, "$pre$expected_line$post");
-	update_mtime($file_path, $meta->{iso_ts});
-	print("Updated: $file_path <-- $expected_line\n");
+	my $replace_line = "\% ".$ts_fs->strftime('%B %d, %Y');
+	print("$file_path: $found_line -> $replace_line\n");
+
+	write_file($file_path, "$pre$replace_line$post");
+	update_mtime($file_path, $ts_fs);
+
 	return 1;
 }
 
 sub process_file {
 	my ($file_path) = @_;
-	my $line_one = read_line($file_path) // do {
-		print STDERR "Error reading first line from '$file_path'\n";
-		return;
-	};
+
+	my $state = get_file_meta($file_path) //
+		do { print STDERR "$file_path: Error fetching metadata\n"; return; };
+
+	$state->{changed} ||
+		do { print("$file_path: committed, no changes - skip\n"); return; };
+
+	my $line_one = read_line($file_path) //
+		do { print STDERR "$file_path: Error reading first line\n"; return; };
+
 	if ($file_path =~ m{\.md$}si) {
-		return process_file_md($file_path);
+		return process_file_md($file_path, $state);
 	} elsif ($line_one =~ m{^#!(?:/usr)?/bin/sh\b}s) {
-		return process_file_pl_sh($file_path);
+		return process_file_pl_sh($file_path, $state);
 	} elsif ($line_one =~ m{^#!/usr/bin/perl\b}s) {
-		return process_file_pl_sh($file_path);
+		return process_file_pl_sh($file_path, $state);
 	}
+
 	print("$file_path: not applicable\n");
 	undef
 }
 
 sub update_mtime {
-	my ($file_path, $iso_ts) = @_;
-
-	my $ts = Time::Piece->strptime($iso_ts, "%Y-%m-%d %H:%M:%S") ||
-		do { print STDERR "$file_path: failed to parse $iso_ts\n"; return; };
+	my ($file_path, $ts) = @_;
 
 	my $epoch_time = $ts->epoch ||
-		do { print STDERR "$file_path: failed to get epoch $iso_ts\n"; return; };
+		do { print STDERR "$file_path: failed to get epoch $ts\n"; return; };
 
 	utime($epoch_time, $epoch_time, $file_path) or
 		do { print STDERR "$file_path: failed to update mtime: $!\n"; };
@@ -118,41 +128,17 @@ sub update_mtime {
 sub get_file_meta {
 	my ($file_path) = @_;
 
-	my $meta_fs = get_file_fs_meta($file_path) //
-		do { print STDERR "Error getting filesystem meta on '$file_path'\n"; return; };
-
-	my $meta_git = get_file_git_meta($file_path); # // do { print STDERR "Error getting git meta on '$file_path'\n"; return; };
-
-	my $meta = ($meta_git && !$meta_git->{changed} && $meta_git->{iso_ts} lt $meta_fs->{iso_ts}) ? $meta_git : $meta_fs;
-	# print("stat, fs=$meta_fs->{iso_ts}, git=$meta_git->{iso_ts}, res=$meta->{iso_ts}\n");
-	return $meta;
-}
-
-sub get_file_fs_meta {
-	my ($file_path) = @_;
 	my $mtime = (stat($file_path))[9] //
 		do { print STDERR "Error running stat+mtime on '$file_path': $!\n"; return; };
-	my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime($mtime);
-	return get_tsinfo_from_iso(sprintf("%04d-%02d-%02d %02d:%02d:%02d", $year + 1900, $mon + 1, $mday, $hour, $min, $sec));
-}
+	my $ts_fs = Time::Piece->localtime($mtime) //
+		do { print STDERR "Error, unrecognizable mtime: $mtime\n"; return; };
 
-sub get_file_git_meta {
-	my ($file_path) = @_;
-	my $git_iso_ts = readpipe(q{git log -1 --format=%cd --date=format:"%Y-%m-%d %H:%M:%S" -- }.cmd_arg($file_path)) =~ s/\v+//gsr;
+	my $mtime_git = readpipe(q{git log -1 --format=%cd --date=format:"%s" -- }.cmd_arg($file_path)) =~ m/^(\d+)/s ? $1 : undef;
+	my $ts_git = $mtime_git ? Time::Piece->localtime($mtime_git) : undef;
 	my $git_status = readpipe("git status --porcelain ".cmd_arg($file_path)) =~ s/\v+//gsr;
-	my $meta_git = get_tsinfo_from_iso($git_iso_ts) // return;
-	$meta_git->{changed} = $git_status ? 1 : 0;
-	return $meta_git;
-}
+	my $changed = $git_status ? 1 : 0;
 
-sub get_tsinfo_from_iso {
-	my ($iso_ts) = @_;
-	my ($year, $mon, $mday, $hour, $min, $sec) = ($iso_ts =~ m{^(\d+)-(\d+)-(\d+) (\d+):(\d+):(\d+)$});
-	$year || return;
-	# print("$iso_ts --> $year, $mon, $mday, $hour, $min, $sec\n");
-	my $mon_name = $month_names->[$mon - 1] // return;
-	return { year => $year, mon => $mon, mon_name => $mon_name, mday => $mday,
-		mdy => sprintf("%s %d, %04d", $mon_name, $mday + 0, $year), iso_ts => $iso_ts };
+	return { ts_fs => $ts_fs, ts_git => $ts_git, changed => $changed };
 }
 
 sub read_line {
