@@ -6,7 +6,7 @@ use strict;
 use warnings;
 use Fcntl();
 use Time::HiRes();
-use Getopt::Long qw(:config no_auto_abbrev no_ignore_case bundling);
+use Getopt::Long qw(:config no_auto_abbrev no_ignore_case bundling pass_through);
 
 Getopt::Long::GetOptions (
 	'resource|r=s' => \(my $resource_id), # ID of the resource everyone competes for
@@ -22,7 +22,7 @@ Getopt::Long::GetOptions (
 	'sweep' => \(my $sweep), # list existing semaphores and purge zombies
 	'verbose|v+' => \(my $verbose = 0), # verbosity level, can be specified multiple times
 	'help|h' => sub { help(); exit(0); } # need help?
-) or quit(1, "Invalid command line options.\nRun with '--help'\n");
+);
 
 my $_sep_ = ' '; # queue descriptor field separator: line, pid, started, leased, exclusivity, concurrency, sema_pid, sema_started
 my $rx_pid_line = qr/^((\d++)\Q$_sep_\E([\d\.]++)\Q$_sep_\E([\d\.]++)\Q$_sep_\E(\w++)\Q$_sep_\E(\d++)\Q$_sep_\E(\d++)\Q$_sep_\E([\d\.]++))$/m;
@@ -34,7 +34,7 @@ my $command_present = scalar(@ARGV); # instead of returning success - launch the
 if ($command_present) {
 	$ARGV[0] eq '--' && shift(@ARGV); # remove '--' if present
 	$owner_pid //= $$;
-	$resource_id //= eval {
+	$resource_id //= eval { # only load the module when needed
 		require Digest::SHA;
 		Digest::SHA::sha256_base64(join(q( ), @ARGV)) =~ s|\W|_|gr
 	};
@@ -43,7 +43,8 @@ if ($command_present) {
 
 ($resource_id && $resource_id =~ /^(?=\w)[\w\-]{3,64}+(?<=\w)$/s) ||
 	quit(1, "Resource ID must be 3-64 characters long: allowed characters are [a-zA-Z0-9_-]\n");
-defined($owner_pid) || quit(1, "PID is invalid or missing\n");
+defined($owner_pid) || quit(1, "PID is missing\n");
+$owner_pid =~ m{^[1-9]\d*$}s || quit(1, "Invalid PID: $owner_pid\n");
 
 $| = 1; # STDOUT->autoflush(1);
 
@@ -57,7 +58,9 @@ if (!$release) {
 		$wakeup_interval_sec = undef; # no waiting, no waking
 	} else {
 		$wakeup_interval_sec //= min(30, exp(0.71 * log($total_wait_sec)) * 0.2); # default derived from wait time
-		($wakeup_interval_sec >= 0.001) || quit(1, "Wake up interval must be >= 0.001");
+		(($wakeup_interval_sec =~ /^(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?$/s) &&
+			($wakeup_interval_sec >= 0.001)) ||
+			quit(1, "Wake up interval must be a floating point number >= 0.001");
 	}
 
 	if (defined($kill_age_spec)) {
@@ -80,7 +83,7 @@ if (!$release) {
 	($exclusivity =~ /^[A-Za-z]{1,48}+$/s) ||
 		quit(1, "Invalid exclusivity flag, allowed 1 to 48 alphabetic characters");
 
-	($concurrency > 0) or quit(1, "Concurency must be a positive whole number");
+	($concurrency =~ m{^[1-9]\d*$}s) or quit(1, "Concurency must be a positive whole number");
 }
 
 $queue_dir = ensure_lock_dir($queue_dir);
@@ -104,7 +107,7 @@ quit(3, "Owner PID $owner_pid is not found") if (!$owner_started && !$release);
 my $this_entry_text = $release ? '' :
 	(join($_sep_, ($owner_pid, $owner_started, 0, $exclusivity, $concurrency, $$, $sema_started)) . "\n");
 
-$SIG{PIPE} = $SIG{USR1} = $SIG{USR2} = 'IGNORE'; # this signal is used to wake up the process from sleep
+$SIG{USR1} = 'IGNORE'; # this signal is used to wake up the process from sleep
 
 # wake up signal handler
 my $usr1_wake_handler = ($verbose >= 3) ? sub { prnt("Received wake-up (USR1): {$owner_pid/$$}\n") } : sub {};
