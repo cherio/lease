@@ -12,7 +12,9 @@ ex_code=0
 
 # Refresh revision dates and copyright year
 "${this_script%/*}/refresh-dates" ./doc/*.md
-ex_code="$((ex_code + $?))"
+man_updated="$?"
+[ "$man_updated" -ne 0 ] && rm -f ./doc/*.1
+ex_code="$((ex_code + man_updated))"
 
 # Refresh man files from markdown documents
 "${this_script%/*}/refresh-man"

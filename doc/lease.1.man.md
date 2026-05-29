@@ -2,8 +2,8 @@
 title: lease
 section: 1
 header: User Commands
-date: May 27, 2026
-footer: Version 1.0.0
+date: May 28, 2026
+footer: Version 1.0.1
 ---
 
 # NAME
@@ -47,8 +47,9 @@ the resource will be released when the owner process ends.
 
 **-d {directory} | -\-dir={directory}**
 : A directory where the semaphore/resource/queue files are stored. Defaults to
-XDG_RUNTIME_DIR/zemaphore if present, falling back to
-XDG_DATA_HOME/.local/share/zemaphore when systemd is not present.
+XDG_RUNTIME_DIR/zemaphore (zemaphore is the legacy name of the utility) if
+present, falling back to XDG_DATA_HOME/.local/share/zemaphore when systemd is
+not present.
 
 **-c {number} | -\-concurrency={number}**
 : Maximum number of processes allowed to own/lease the resource at the same time
