@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: 0BSD
+# Copyright (C) 2026 Yuri Cherio
 #
 # View man file
 
@@ -7,4 +8,4 @@ this_script="$(realpath -s "$0")"
 project_dir="${this_script%/*/*}"
 
 "$project_dir/scripts/refresh-man"
-man "$project_dir/doc/${this_script##*man.}.1"
+man "$project_dir/doc/${this_script##*/man.}.1"

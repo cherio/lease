@@ -1,0 +1,26 @@
+#!/bin/sh
+# SPDX-License-Identifier: 0BSD
+# Copyright (C) 2026 Yuri Cherio
+#
+# create a new tag incrementing the patch component of the previous tag
+
+this_script="$(realpath -s "$0")"
+cd "${this_script%/*/*}" || { echo "Failed to change directory" >&2; exit 1; }
+[ -d "./.git" ] || { echo "Can not recognize the directory" >&2; exit 1; }
+
+tag_last="$(git tag --sort=v:refname | tail -n1)"
+
+ver_major_minor="${tag_last%.*}"
+ver_major="${ver_major_minor%.*}"
+ver_minor="${ver_major_minor#*.}"
+ver_patch="${tag_last##*.}"
+
+ver_patch_new=$((ver_patch + 1))
+
+tag_new="$ver_major.$ver_minor.$ver_patch_new"
+
+cat <<EOF
+# $tag_last --> $tag_new
+git tag -a '$tag_new' -m 'Release $tag_new'
+git push --tags
+EOF
