@@ -114,6 +114,7 @@ $SIG{USR1} = 'IGNORE'; # this signal is used to wake up the process from sleep
 # wake up signal handler
 my $usr1_wake_handler = ($verbose >= 3) ? sub { prnt("Received wake-up (USR1): {$owner_pid/$$}\n") } : sub {};
 
+my $pid_started_cache = {};
 my $owner_signalled = {}; # pid => [delay,signal,...]; problem: may accumulate terminated process records
 
 while (1) { # Keep waiting
@@ -171,7 +172,8 @@ sub revalidate_queue {
 
 	# loop only variables
 	my $entries = []; # [semaphore entries] - all from the file
-	my $owners = {}; # pid -> [owner entries]
+	my $owners = {}; # pid:started -> [owner entries]
+	$pid_started_cache = {}; # pid -> [start time] cache
 
 	while ($queue_text_wrk =~ m/$rx_pid_line/g) { # parse the file, first pass
 		my ($q_src, $q_pid, $q_started, $q_leased, $q_exclusivity, $q_concurrency, $q_sema_pid, $q_sema_started) = ($1, $2, $3, $4, $5, $6, $7, $8);
@@ -184,33 +186,29 @@ sub revalidate_queue {
 		$sema_found_self |= ($$ == $q_sema_pid);
 		$owner_found_self |= ($q_pid == $owner_pid);
 
-		my $entry = { pid => $q_pid, # src => $q_src,
-			started => $q_started, leased => $q_leased, exclusivity => $q_exclusivity, concurrency => $q_concurrency,
+		my $oid = "$q_pid:$q_started";
+		my $entry = { pid => $q_pid, started => $q_started, oid => $oid,
+			leased => $q_leased, exclusivity => $q_exclusivity, concurrency => $q_concurrency,
 			sema_pid => $q_sema_pid, sema_started => $q_sema_started };
 
 		push(@$entries, $entry);
-
-		my $owner = $owners->{$q_pid} //= { leased => $q_leased, entries => [] };
-		push(@{$owner->{entries}}, $entry);
-
-		next if $owner->{remove};
 
 		if ($release && $owner_pid == $q_pid) {
 			prnt("Marking for release: $q_pid\n") if ($verbose >= 3);
 			$release_found = 1;
 			$sema_exit_code //= 0;
-			$owner->{remove} = 1;
+			$entry->{remove} = 1;
 			next;
 		}
 
-		if (!exists $owner->{missing}) {
-			my $q_started_curr = get_pid_started($q_pid) // 0; # updated item started timestamp
-			if ($owner->{missing} = (!$q_started_curr || $q_started_curr ne $q_started)) {
-				prnt("Owner is gone, skipping: $q_pid\n") if ($verbose >= 2);
-				$owner->{remove} = 1;
-				next; # next line - owner is gone anyway
-			};
-		}
+		my $q_started_curr = get_pid_started($q_pid) // 0; # updated item started timestamp
+		if (!$q_started_curr || $q_started_curr ne $q_started) {
+			prnt("Owner is gone, skipping: $q_pid\n") if ($verbose >= 2);
+			$entry->{remove} = 1;
+			next; # next line - owner is gone anyway
+		};
+
+		my $owner = $owners->{$oid} //= { pid => $q_pid, started => $q_started, oid => $oid, leased => $q_leased };
 
 		if ($owner->{leased} > $q_leased && $q_leased) {
 			$owner->{leased} = $q_leased; # this applies to all owner PID entries
@@ -218,10 +216,9 @@ sub revalidate_queue {
 	}
 
 	# purge terminated process IDs
-	for my $signalled_pid (keys %$owner_signalled) {
-		my $owner = $owners->{$signalled_pid};
-		if (!$owner || $owner->{remove}) {
-			delete $owner_signalled->{$signalled_pid} ;
+	for my $signalled_oid (keys %$owner_signalled) {
+		if (!$owners->{$signalled_oid}) {
+			delete $owner_signalled->{$signalled_oid};
 		}
 	}
 
@@ -231,13 +228,14 @@ sub revalidate_queue {
 	my ($max_lease_cnt, $owner_count) = (10000, 0);
 
 	for my $entry (@$entries) {
-
-		my $pid = $entry->{pid};
-		my $owner = $owners->{$pid} // quit(10, "Error! Abnormal state. Owner record not found: $pid\n");
-		if ($owner->{remove}) { # released, missing/terminated owners
+		if ($entry->{remove}) { # released, missing/terminated owners
 			wake_up_sema($entry->{sema_pid});
 			next;
 		}
+
+		my $oid = $entry->{oid};
+		my $owner = $owners->{$oid} // quit(10, "Error! Abnormal state. Owner record not found: $oid\n");
+		my $pid = $owner->{pid};
 
 		if ($pid != $owner_pid && $owner->{leased}) { # some other (not me/self) leased
 			# check if the lease expired
@@ -252,7 +250,7 @@ sub revalidate_queue {
 			}
 			# check if the lease needs to be ordered to terminate
 			if (defined($signal_spec)) {{ # killing others is allowed
-				my $owner_sig_spec = $owner_signalled->{$pid} // $signal_spec;
+				my $owner_sig_spec = $owner_signalled->{$oid} // $signal_spec;
 				$owner_sig_spec || last; # skip signaling altogether
 
 				my $age_allowance = $owner_sig_spec->[0];
@@ -262,10 +260,10 @@ sub revalidate_queue {
 					kill(my $sig_name = $owner_sig_spec->[1], $pid);
 					prnt("Sending $sig_name to=$pid, age=$owner_lease_age\n") if ($verbose >= 2);
 					if (@$owner_sig_spec < 4) {
-						$owner_signalled->{$pid} = 0;
+						$owner_signalled->{$oid} = 0;
 						$till_sig = 1;
 					} else {
-						$owner_signalled->{$pid} = $owner_sig_spec = [ @$owner_sig_spec[ 2 .. $#$owner_sig_spec ] ];
+						$owner_signalled->{$oid} = $owner_sig_spec = [ @$owner_sig_spec[ 2 .. $#$owner_sig_spec ] ];
 						$till_sig = min(1, $owner_sig_spec->[0] - $age_allowance); # delay between the two signals
 					}
 				}
@@ -397,13 +395,14 @@ sub min {
 sub bool { $_[0] ? 'Y' : 'N' }
 
 sub get_pid_started {
-	my $pid_file = "/proc/".($_[0] || return)."/stat"; # https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
-	# find /proc/*/ -maxdepth 1 -uid "$(id -u)" -name stat 2>/dev/null | xargs -I {} wc -c {} 2>/dev/null | sort -Vr | head -n 3
-	my $proc_stats = (-e $pid_file ? sysread_file($pid_file) : undef) || return;
+	$_[0] || return;
+	exists $pid_started_cache->{$_[0]} && return $pid_started_cache->{$_[0]};
+	my $pid_file = "/proc/$_[0]/stat"; # https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
+	my $proc_stats = sysread_file($pid_file) || return $pid_started_cache->{$_[0]} = undef;
 	my $cmd_end_pos = rindex($proc_stats, ')'); # after command line
 	my @pid_stats = split(/ /, substr($proc_stats, $cmd_end_pos + 2)); # original indexes are [2, 21], but we start with the 2nd
 	my ($state, $time_started) = @pid_stats[0, 19]; # POSIX::sysconf(&POSIX::_SC_CLK_TCK); see https://perldoc.perl.org/POSIX.html
-	return ($state && !($state eq 'Z' || $state eq 'X')) ? $time_started : undef;
+	return $pid_started_cache->{$_[0]} = (($state && !($state eq 'Z' || $state eq 'X')) ? $time_started : undef);
 }
 
 sub run_synchronized {
@@ -519,8 +518,8 @@ sub run_blocking {
 	return { result => $result, elapsed => Time::HiRes::time() - $started, completed => !$@ };
 }
 
-sub sysread_file {
-	sysopen(my $file_handle, $_[0], Fcntl::O_RDONLY) or return;
+sub sysread_file { # non-failing read
+	sysopen(my $file_handle, $_[0] // return, Fcntl::O_RDONLY) or return;
 	sysread($file_handle, my $buffer, 4096) or return;
 	return $buffer;
 }
