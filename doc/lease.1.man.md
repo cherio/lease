@@ -2,8 +2,8 @@
 title: lease
 section: 1
 header: User Commands
-date: May 31, 2026
-footer: Version 1.0.3
+date: June 02, 2026
+footer: Version 1.0.4
 ---
 
 # NAME
