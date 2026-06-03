@@ -21,6 +21,7 @@ tag_new="$ver_major.$ver_minor.$ver_patch_new"
 
 cat <<EOF
 # $tag_last --> $tag_new
+git push
 git tag -a '$tag_new' -m 'Release $tag_new'
 git push --tags
 EOF
