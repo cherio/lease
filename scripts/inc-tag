@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: 0BSD
 # Copyright (C) 2026 Yuri Cherio
 #
-# create a new tag incrementing the patch component of the previous tag
+# calculate a new tag incrementing the patch component of the previous tag
+# immutable, it doesn't make any changes
 
 this_script="$(realpath -s "$0")"
 cd "${this_script%/*/*}" || { echo "Failed to change directory" >&2; exit 1; }

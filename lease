@@ -19,6 +19,7 @@ Getopt::Long::GetOptions (
 	'kill|k=s' => \(my $kill_age_spec), # if another owner process is "stuck", TERM it after this many SECONDS
 	'expire|e=f' => \(my $expire_age_sec), # resource will be considered automatically unlocked after this period
 	'release|R' => \(my $release), # request to release the lock on the resource
+	'exit|E=i' => \(my $wait_expire_exit_code = 122), # verbosity level, can be specified multiple times
 	'sweep' => \(my $sweep), # list existing semaphores and purge zombies
 	'verbose|v+' => \(my $verbose = 0), # verbosity level, can be specified multiple times
 	'help|h' => sub { help(); exit(0); } # need help?
@@ -27,6 +28,10 @@ Getopt::Long::GetOptions (
 my $_sep_ = ' '; # queue descriptor field separator: line, pid, started, leased, exclusivity, concurrency, sema_pid, sema_started
 my $rx_pid_line = qr/^((\d++)\Q$_sep_\E([\d\.]++)\Q$_sep_\E([\d\.]++)\Q$_sep_\E(\w++)\Q$_sep_\E(\d++)\Q$_sep_\E(\d++)\Q$_sep_\E([\d\.]++))$/m;
 
+$wait_expire_exit_code //= 122;
+$wait_expire_exit_code =~ m{^\d+$} || quit(123, "Invalid exit code");
+my $internal_err = min($wait_expire_exit_code + 1, 127);
+
 $sweep && do { sweep_resource_locks(); exit(0); };
 
 # If user command is specified, launch it upon a successful acquisition of the lease
@@ -34,7 +39,7 @@ my $command_present = scalar(@ARGV);
 if ($command_present) {
 	$ARGV[0] eq '--' && shift(@ARGV); # remove '--' if present
 	$owner_pid //= $$;
-	$resource_id //= eval { # only load the module when needed
+	$resource_id //= do { # only load the module when needed
 		require Digest::SHA;
 		Digest::SHA::sha256_base64(join(q( ), @ARGV)) =~ s|\W|_|gr
 	};
@@ -43,10 +48,10 @@ if ($command_present) {
 
 # validate resource ID token
 ($resource_id && $resource_id =~ /^(?=\w)[\w\-]{3,64}+(?<=\w)$/s) ||
-	quit(1, "Resource ID must be 3-64 characters long: allowed characters are [a-zA-Z0-9_-]\n");
+	quit($internal_err, "Resource ID must be 3-64 characters long: allowed characters are [a-zA-Z0-9_-]\n");
 # validate owner/leassee process ID.
-defined($owner_pid) || quit(1, "PID is missing\n");
-$owner_pid =~ m{^[1-9]\d*$}s || quit(1, "Invalid PID: $owner_pid\n");
+defined($owner_pid) || quit($internal_err, "PID is missing\n");
+$owner_pid =~ m{^[1-9]\d*$}s || quit($internal_err, "Invalid PID: $owner_pid\n");
 
 $| = 1; # STDOUT->autoflush(1);
 
@@ -54,7 +59,7 @@ my $signal_spec; # a list of delays and signals: delay[=signal][:delay[=signal]]
 
 if (!$release) {
 	($total_wait_sec //= 0) == 0 || $total_wait_sec >= 0.01 ||
-		quit(1, "Wait time can be zero or >= 0.01");
+		quit($internal_err, "Wait time can be zero or >= 0.01");
 
 	if (!$total_wait_sec) {
 		$wakeup_interval_sec = undef; # no waiting, no waking
@@ -62,7 +67,7 @@ if (!$release) {
 		$wakeup_interval_sec //= min(30, exp(0.71 * log($total_wait_sec)) * 0.2); # default derived from wait time
 		(($wakeup_interval_sec =~ /^(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?$/s) &&
 			($wakeup_interval_sec >= 0.001)) ||
-			quit(1, "Wake up interval must be a floating point number >= 0.001");
+			quit($internal_err, "Wake up interval must be a floating point number >= 0.001");
 	}
 
 	if (defined($kill_age_spec)) {
@@ -71,21 +76,21 @@ if (!$release) {
 		my ($age_last, $sig_last) = (-1, 'TERM');
 		while ($kill_age_spec =~ m{ (?<=^|:) (\d+(?:[,\.]\d+)?) (?:\=(\w+(?:[-+]\d+)?))? (?=$|:) }xgs) {
 			my ($age, $sig) = ($1, $2);
-			$age_last < $age || quit(1, "Signal delay intervals must go in ascending order");
+			$age_last < $age || quit($internal_err, "Signal delay intervals must go in ascending order");
 			push(@$signal_spec, ($age_last = $age), ($sig_last = uc($sig // $sig_last)));
-			# $known_sigs{$sig_last} || quit(1, "Invalid signal: $sig_last");
+			# $known_sigs{$sig_last} || quit($internal_err, "Invalid signal: $sig_last");
 		}
-		scalar(@$signal_spec) || quit(1, "Invalid signal specification");
+		scalar(@$signal_spec) || quit($internal_err, "Invalid signal specification");
 		prnt("Signal delay intervals: ".join(',', @$signal_spec)."\n") if ($verbose >= 3);
 	}
 
 	!defined($expire_age_sec) || $expire_age_sec >= 0 ||
-		quit(1, "Expiration time can't be negative");
+		quit($internal_err, "Expiration time can't be negative");
 
 	($exclusivity =~ /^[A-Za-z]{1,48}+$/s) ||
-		quit(1, "Invalid exclusivity flag, allowed 1 to 48 alphabetic characters");
+		quit($internal_err, "Invalid exclusivity flag, allowed 1 to 48 alphabetic characters");
 
-	($concurrency =~ m{^[1-9]\d*$}s) or quit(1, "Concurency must be a positive whole number");
+	($concurrency =~ m{^[1-9]\d*$}s) or quit($internal_err, "Concurency must be a positive whole number");
 }
 
 $queue_dir = ensure_lock_dir($queue_dir);
@@ -104,8 +109,8 @@ prnt("$res_label\n") if ($verbose);
 
 # Gather process information and SELF-validate
 my $owner_started = get_pid_started($owner_pid) // 0;
-my $sema_started = get_pid_started($$) // quit(2, "ERROR! Semaphore can not detect its PID: $$\n");
-quit(3, "Owner PID $owner_pid is not found") if (!$owner_started && !$release);
+my $sema_started = get_pid_started($$) // quit($internal_err, "ERROR! Semaphore can not detect its PID: $$\n");
+quit($internal_err, "Owner PID $owner_pid is not found") if (!$owner_started && !$release);
 my $this_entry_text = $release ? '' :
 	(join($_sep_, ($owner_pid, $owner_started, 0, $exclusivity, $concurrency, $$, $sema_started)) . "\n");
 
@@ -123,7 +128,8 @@ while (1) { # Keep waiting
 	while (1) { # wait to lock the queue file
 		$sema_lock_result = run_synchronized($queue_file, $sema_wait_left + 0.01, sub { revalidate_queue(@_, $this_entry_text); });
 		last if $sema_lock_result->{completed};
-		(($sema_wait_left = $sema_give_up_deadline_sec - Time::HiRes::time()) > 0) or quit(4, "Couldn't lock semaphore queue file: $queue_file");
+		(($sema_wait_left = $sema_give_up_deadline_sec - Time::HiRes::time()) > 0) or
+			quit($internal_err, "Couldn't lock semaphore queue file: $queue_file");
 	}
 	$this_entry_text = ''; # this should be done just once
 	my $reval_result = $sema_lock_result->{result};
@@ -135,6 +141,13 @@ while (1) { # Keep waiting
 	if (defined($sema_exit_code)) {
 		if ($sema_exit_code == 0 && $command_present) {
 			$sema_exit_code = system(@ARGV);
+			if ($sema_exit_code == -1) {
+				prnt("Failed to execute: $!\n", *STDERR);
+			} elsif ($sema_exit_code & 127) {
+				prnt(sprintf "child died with signal %d, %s coredump\n", ($sema_exit_code & 127), ($sema_exit_code & 128) ? 'with' : 'without', *STDERR);
+			} else {
+				$sema_exit_code >>= 8;
+			}
 			system($0, '-r', $resource_id, '-p', $owner_pid, '--release');
 		}
 		exit($sema_exit_code);
@@ -144,7 +157,7 @@ while (1) { # Keep waiting
 	my $remaining_wait_sec = $total_wait_sec - $current_wait_time;
 	$nap_seconds = min($nap_seconds, $remaining_wait_sec, $wakeup_interval_sec); # minimum between scheduld nap time and remaining wait time
 	prnt("Curr wait time: {$current_wait_time}, left: {$remaining_wait_sec}, next nap: {$nap_seconds} sec, {$owner_pid/$$}\n") if ($verbose >= 2);
-	quit(5, "I've been waiting for too long, bye-bye: [$res_label].\n") if ($remaining_wait_sec <= 0);
+	quit($wait_expire_exit_code, "I've been waiting for too long, bye-bye: [$res_label].\n") if ($remaining_wait_sec <= 0);
 
 	{
 		local $SIG{USR1} = $usr1_wake_handler; # allow the signal to wake up the process
@@ -157,7 +170,7 @@ exit(0);
 
 sub revalidate_queue {
 	my ($queue_fhandle, $this_entry_text) = @_; # Semaphore file handle
-	quit(10, "Lock file file handle is not initialized") if !defined($queue_fhandle);
+	quit($internal_err, "Lock file file handle is not initialized") if !defined($queue_fhandle);
 
 	# Read process QUEUE file
 	my $queue_text_src = do { local $/; <$queue_fhandle> } . ''; # Slurp the whole queue file
@@ -226,7 +239,7 @@ sub revalidate_queue {
 
 	for my $entry (@$entries) {
 		my ($oid, $pid) = @$entry{qw/oid pid/};
-		my $owner = $owners->{$oid} // quit(10, "Error! Abnormal state. Owner record not found: $oid\n");
+		my $owner = $owners->{$oid} // quit($internal_err, "Error! Abnormal state. Owner record not found: $oid\n");
 
 		if ($pid != $owner_pid && $owner->{leased}) { # some other (not me/self) leased
 			# check if the lease expired
@@ -282,7 +295,7 @@ sub revalidate_queue {
 			if ($entry->{sema_pid} == $$ && !$owner->{leased}) {
 				my $self_sema_wait_time = Time::HiRes::time() - $request_time_sec;
 				if ($total_wait_sec <= $self_sema_wait_time) {
-					$sema_exit_code //= 12; # I waited too long but the resource is still not available, time to quit
+					$sema_exit_code //= $wait_expire_exit_code; # I waited too long but the resource is still not available, time to quit
 					next; # next line
 				}
 			}
@@ -314,8 +327,8 @@ sub revalidate_queue {
 	}
 
 	$sema_exit_code //= 0 if $release_found;
-	$sema_exit_code //= 13 if !$sema_found_self; # someone else purged descriptor with this semaphore - quit
-	$sema_exit_code //= 14 if !$owner_found_self; # someone else purged descriptor with this owner - quit
+	$sema_exit_code //= $internal_err if !$sema_found_self; # someone else purged descriptor with this semaphore - quit
+	$sema_exit_code //= $internal_err if !$owner_found_self; # someone else purged descriptor with this owner - quit
 
 	# Test if queue CHANGED and save if it changed
 	my $queue_changed = $queue_text_res ne $queue_text_src;
@@ -331,7 +344,7 @@ sub revalidate_queue {
 	}
 
 	prnt(sprintf("Queue list changed: %s, exit code: {%s}, nap: {%s}, {%s/%s}\n",
-		bool($queue_changed), $sema_exit_code // '', $next_nap_seconds // '', $owner_pid, $$)) if ($verbose >= 2);
+		$queue_changed ? 'Y' : 'N', $sema_exit_code // '', $next_nap_seconds // '', $owner_pid, $$)) if ($verbose >= 2);
 
 	return { exit_code => $sema_exit_code, nap_seconds => $next_nap_seconds } ;
 }
@@ -340,40 +353,37 @@ sub wake_up_sema {
 	$_[0] > 0 && $_[0] != $$ && kill('USR1', $_[0]);
 }
 
-sub get_default_lock_dir {
-	my $lock_dir_name = 'zemaphore'; # legacy name for compatibility
-	my $xdg_runtime_dir = $ENV{XDG_RUNTIME_DIR} // "/run/user/$<";
-	my $tmpfs_queue_dir = "$xdg_runtime_dir/$lock_dir_name";
-	-d $tmpfs_queue_dir && return wantarray ? ($tmpfs_queue_dir, 1) : $tmpfs_queue_dir;
-
-	# fallback to $HOME/.local/share for compatibility with OS without XDG_RUNTIME_DIR
-	my $legacy_dir = ($ENV{XDG_DATA_HOME} // "$ENV{HOME}/.local/share")."/$lock_dir_name";
-	-d $legacy_dir && return ($legacy_dir, 1);
-	!-d $xdg_runtime_dir && return wantarray ? ($legacy_dir, 0) : $legacy_dir;
-
-	if (wantarray) {
-		mkdir($tmpfs_queue_dir) or die "Could not create LOCK directory: $tmpfs_queue_dir\n$!\n";
-	}
-	return wantarray ? ($tmpfs_queue_dir, 1) : $tmpfs_queue_dir;
-}
-
 sub ensure_lock_dir {
 	my ($dir2ensure) = @_;
 
 	if (!$dir2ensure) {
-		($dir2ensure, my $dir_ensured) = get_default_lock_dir();
-		$dir_ensured && return $dir2ensure;
+		my $lock_dir_name = 'zemaphore'; # legacy name for compatibility
+		my $xdg_runtime_dir = $ENV{XDG_RUNTIME_DIR} // "/run/user/$<";
+		my $tmpfs_queue_dir = "$xdg_runtime_dir/$lock_dir_name";
+		-d $tmpfs_queue_dir && return $tmpfs_queue_dir;
+
+		# fallback to $HOME/.local/share for compatibility with OS without XDG_RUNTIME_DIR
+		my $legacy_dir = ($ENV{XDG_DATA_HOME} // "$ENV{HOME}/.local/share")."/$lock_dir_name";
+		-d $legacy_dir && return $legacy_dir;
+
+		if (-d $xdg_runtime_dir) {
+			mkdir($tmpfs_queue_dir) or quit($internal_err, "Could not create LOCK directory: $tmpfs_queue_dir\n$!\n");
+			return $tmpfs_queue_dir;
+		}
+
+		$dir2ensure = $legacy_dir;
+	} elsif (-d $dir2ensure) {
+		 return -d $dir2ensure;
 	}
 
-	if (!-d $dir2ensure) {
-		eval { require File::Path }; # only load the module when needed
-		File::Path::make_path($dir2ensure) or quit(2, "Couldn't create LOCK directory: $dir2ensure");
-		chmod 0700, $dir2ensure;
-		prnt("Created LOCK directory: $dir2ensure\n") if ($verbose);
-	}
+	require File::Path; # only load the module when needed
+	File::Path::make_path($dir2ensure) or quit($internal_err, "Couldn't create LOCK directory: $dir2ensure");
+	chmod 0700, $dir2ensure;
+	prnt("Created LOCK directory: $dir2ensure\n") if ($verbose);
 
 	return $dir2ensure;
 }
+
 
 sub min {
 	my $result;
@@ -383,16 +393,15 @@ sub min {
 	return $result;
 }
 
-sub bool { $_[0] ? 'Y' : 'N' }
-
 sub get_pid_started {
 	$_[0] || return;
 	exists $pid_started_cache->{$_[0]} && return $pid_started_cache->{$_[0]};
 	my $pid_file = "/proc/$_[0]/stat"; # https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
-	my $proc_stats = sysread_file($pid_file) || return $pid_started_cache->{$_[0]} = undef;
+	sysopen(my $file_handle, $pid_file, Fcntl::O_RDONLY) or return $pid_started_cache->{$_[0]} = undef;
+	sysread($file_handle, my $proc_stats, 4096) or return $pid_started_cache->{$_[0]} = undef;
 	my $cmd_end_pos = rindex($proc_stats, ')'); # after command line
-	my @pid_stats = split(/ /, substr($proc_stats, $cmd_end_pos + 2)); # original indexes are [2, 21], but we start with the 2nd
-	my ($state, $time_started) = @pid_stats[0, 19]; # POSIX::sysconf(&POSIX::_SC_CLK_TCK); see https://perldoc.perl.org/POSIX.html
+	my @pid_stats = split(/ /, substr($proc_stats, $cmd_end_pos + 2));
+	my ($state, $time_started) = @pid_stats[0, 19]; # original indexes are [2, 21], but we start with the 2nd
 	return $pid_started_cache->{$_[0]} = (($state && !($state eq 'Z' || $state eq 'X')) ? $time_started : undef);
 }
 
@@ -406,7 +415,7 @@ sub run_synchronized {
 	($_ = delete $sema_result->{handle}) && close($_); # release file lock
 	#prnt("DEBUG: sema closed $$\n");
 
-	die ($@) if ($@); # re-raise the exception
+	quit($internal_err, $@) if ($@); # re-raise the exception
 	return { result => $result, completed => 1 }; # no error
 }
 
@@ -418,8 +427,8 @@ sub lock_semaphore {
 		run_blocking($timeout, sub {
 			while (1) {
 				sysopen($sema_fhandle, $sema_file, Fcntl::O_RDWR|Fcntl::O_CREAT) or
-					die "Failed to open '$sema_file': $!"; # oh well, we tried
-				flock($sema_fhandle, Fcntl::LOCK_EX) or die "Failed to flock '$sema_file': $!"; # refuse to continue
+					quit($internal_err, "Failed to open '$sema_file': $!"); # oh well, we tried
+				flock($sema_fhandle, Fcntl::LOCK_EX) or quit($internal_err, "Failed to flock '$sema_file': $!"); # refuse to continue
 
 				# ensure no one renamed, replaced or removed the file while we were waiting for 'flock'
 				my $hndl_inode = ([stat($sema_fhandle)])->[1] // 'y';
@@ -433,7 +442,7 @@ sub lock_semaphore {
 
 	if ($@ || !$lock_result->{completed}) { # there was an error or timed out
 		close($sema_fhandle) if defined($sema_fhandle); # release file lock
-		die ($@) if ($@);
+		quit($internal_err, $@) if ($@);
 		$sema_fhandle = undef;
 	}
 
@@ -505,14 +514,8 @@ sub run_blocking {
 		return $result;
 	};
 
-	die ($@) if ($@ && $@ ne $alrm_message);
+	quit($internal_err, $@) if ($@ && $@ ne $alrm_message);
 	return { result => $result, elapsed => Time::HiRes::time() - $started, completed => !$@ };
-}
-
-sub sysread_file { # non-failing read
-	sysopen(my $file_handle, $_[0] // return, Fcntl::O_RDONLY) or return;
-	sysread($file_handle, my $buffer, 4096) or return;
-	return $buffer;
 }
 
 sub prnt {
@@ -523,18 +526,13 @@ sub prnt {
 
 sub get_iso_timestamp { # get_iso_timestamp('[[YY]YY-MM-DD] [HH:mm[:ss[.SSSSSS]]]' [, [Time::HiRes::]time() | Time::HiRes::gettimeofday() ])
 	my ($format, $time) = @_;
-	#print("$format\n");
 
-	if (!$time) {
-		$time = [time(), '0'];
-	} elsif (ref($time) eq '') {
-		$time = $time =~ /^(\d++)(?:\.(\d*))?/ ? [$1, substr(($2 // '') . '000000', 0, 6)] : die("bad seconds");
+	if (ref($time) eq '') {
+		$time = $time =~ /^(\d++)(?:\.(\d*))?/ ? [$1, substr(($2 // '') . '000000', 0, 6)] : quit($internal_err, "bad seconds");
 	}
-	die('bad time') if (ref($time) ne 'ARRAY');
+	quit($internal_err, 'bad time') if (ref($time) ne 'ARRAY');
 
 	my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime($time->[0]);
-	$year += 1900;
-	$mon++;
 	#print(join('|', ($micros, $sec, $min, $hour, $mday, $mon, $year)) . "\n");
 	my $l_pad = sub {
 		my ($val, $len, $ch) = @_;
@@ -546,8 +544,8 @@ sub get_iso_timestamp { # get_iso_timestamp('[[YY]YY-MM-DD] [HH:mm[:ss[.SSSSSS]]
 	my $result = '';
 	while ($format =~ /((.)\2*)/g) { # repeated character
 		my ($seq, $seq_char) = ($1, $2);
-		$result .= $seq_char eq 'Y' ? substr("0000$year", -length($seq))
-			: $seq_char eq 'M' ? $l_pad->($mon, length($seq), '0')
+		$result .= $seq_char eq 'Y' ? substr("0000".($year + 1900), -length($seq))
+			: $seq_char eq 'M' ? $l_pad->($mon + 1, length($seq), '0')
 			: $seq_char eq 'D' ? $l_pad->($mday, length($seq), '0')
 			: $seq_char eq 'd' ? $l_pad->($yday, length($seq), '0')
 			: $seq_char eq 'H' ? $l_pad->($hour, length($seq), '0')
@@ -563,7 +561,7 @@ sub get_iso_timestamp { # get_iso_timestamp('[[YY]YY-MM-DD] [HH:mm[:ss[.SSSSSS]]
 
 sub ls_dir {
 	my ($dir, $check) = @_;
-	opendir(my $dir_handle, $dir) || die("Can not open $dir: $!");
+	opendir(my $dir_handle, $dir) || quit($internal_err, "Can not open $dir: $!");
 	my @files = ();
 	while (defined(my $file = readdir($dir_handle))) {
 		utf8::decode($file);
@@ -590,7 +588,7 @@ sub help {
 	my $man_text = <<'MAN_CONTENTS';
 .\" Automatically generated by Pandoc 3.9.0.2
 .\"
-.TH "lease" "1" "June 02, 2026" "Version 1.0.4" "User Commands"
+.TH "lease" "1" "June 03, 2026" "Version 1.0.5" "User Commands"
 .SH NAME
 \f[B]lease\f[R] \- FIFO semaphore utility that manages resource
 ownership by processes.
@@ -717,6 +715,15 @@ Otherwise it relies on periodic polling and may wait for as long as
 specified with \f[B]\-i\f[R] before checking whether the resource became
 available.
 .TP
+\f[B]\-E {int} | \-\-exit={int}\f[R]
+Custom exit code to return when wait times out and the resource is still
+not available.
+Default is 122.
+This is useful when you need to distinguish between the exit code of the
+user command and failure to acquire the lease in time.
+Any internal semaphore error will result in an exit code that is an
+increment of this, with the default of 123.
+.TP
 \f[B]\-\-sweep\f[R]
 Purge empty queues/resources.
 With \f[B]\-v\f[R], also lists the existing queues and statistics.
@@ -796,6 +803,4 @@ MAN_CONTENTS
 
 	open(my $man_fh, '|-', "man /dev/stdin") or die("Unable to run man: $!\n");
 	print $man_fh $man_text;
-	close($man_fh);
-
 }

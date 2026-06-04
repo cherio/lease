@@ -2,8 +2,8 @@
 title: lease
 section: 1
 header: User Commands
-date: June 02, 2026
-footer: Version 1.0.4
+date: June 03, 2026
+footer: Version 1.0.5
 ---
 
 # NAME
@@ -120,6 +120,11 @@ The lease gets invalidated and the resource/lease record is purged afterward.
 
 : Otherwise it relies on periodic polling and may wait for as long as specified with `-i`
 before checking whether the resource became available.
+
+**-E {int} | -\-exit={int}**
+: Custom exit code to return when wait times out and the resource is still not available. Default is 122.
+This is useful when you need to distinguish between the exit code of the user command and failure to acquire the lease in time.
+Any internal semaphore error will result in an exit code that is an increment of this, with the default of 123.
 
 **-\-sweep**
 : Purge empty queues/resources.
