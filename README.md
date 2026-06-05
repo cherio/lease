@@ -25,6 +25,8 @@ Allows only one resource owner. It makes the parent process a lessee. This waits
 
 The resource becomes available when the parent process terminates or this lease explicitly released (--release).
 
+See the man page for more examples.
+
 ## AUTHORS
 Yuri Cherio
 

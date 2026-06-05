@@ -2,8 +2,8 @@
 title: lease
 section: 1
 header: User Commands
-date: June 03, 2026
-footer: Version 1.0.5
+date: June 04, 2026
+footer: Version 1.0.6
 ---
 
 # NAME
@@ -174,7 +174,7 @@ lease -r 'XYZ' -p "$$" -i 30 -e 240 -w 600 || exit 1
 
 Attempts to lock resource `XYZ` for the calling shell.
 
-Checks availability every 30 seconds while waiting.
+Checks resource availability every 30 seconds while waiting.
 
 If the lock is not available after 10 minutes (600 seconds), exits the calling shell script.
 

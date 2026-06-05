@@ -52,12 +52,9 @@ sub process_copyright {
 	my $year = $ts_fs->strftime('%Y') //
 		do { print STDERR "$file->{path}: odd ts_fs\n"; return; };
 
-	my $contents = $file->{contents} =~ s{(?<=\n|^)([^\v\w]*Copyright \(C\) (?:\d{4}-)?)\d{4}( \V+)(?=\n)}{$1$year$2}sgr;
-	if ($contents ne $file->{contents}) {
-		$file->{contents} = $contents;
-		return $file->{changed} = 1;
-	}
-	return 0;
+	my $contents = $file->{contents} =~ s{(?<=\n|^) ([^\v\w]* Copyright \h+ (?:\([Cc]\)|©) \h+ (?:\d{4}\h* - \h*)?) \d{4} (\h+\V+) (?=\n)}{$1$year$2}xsgr;
+	($file->{changed} = $contents eq $file->{contents} ? 0 : 1) || return;
+	$file->{contents} = $contents;
 }
 
 sub process_md_tags {
@@ -69,12 +66,14 @@ sub process_md_tags {
 	my $date = $ts_fs->strftime('%B %d, %Y') //
 		do { print STDERR "$file->{path}: odd ts_fs\n"; return; };
 
-	my $contents = $file->{contents} =~ s{^((?:[^#]\V*\n)*?date:)\h*\w+\h+\d\d,\h+\d{4}\h*\n}{$1 $date\n}sr;
-	if ($contents ne $file->{contents}) {
-		$file->{contents} = $contents;
-		return $file->{changed} = 1;
-	}
-	return 0;
+	# detect YAML header
+	my $old_header = $file->{contents} =~ m{^(---\n.*?\n---\n)}xs ? $1 : return;
+
+	my $new_header = $old_header =~ s{\n date: \h* \w+\h+\d{1,2},\h+\d{4} \h*\n}{\ndate: $date\n}xsr;
+	$new_header eq $old_header && return; # No change
+
+	$file->{contents} = $new_header . substr($file->{contents}, length($old_header));
+	$file->{changed} = 1;
 }
 
 sub process_file_pl_sh {
